@@ -45,7 +45,9 @@ def _read_mail_sender_json() -> dict | None:
             print(f"  [없음] {path}")
             continue
         try:
-            data = json.loads(path.read_text(encoding="utf-8"))
+            # utf-8-sig transparently strips a UTF-8 BOM if PowerShell wrote
+            # one (Set-Content -Encoding UTF8 adds a BOM by default).
+            data = json.loads(path.read_text(encoding="utf-8-sig"))
             print(f"  [있음] {path}")
             print(f"         내용: {data}")
             return data

@@ -281,7 +281,12 @@ def _local_sender_address() -> str:
         paths.append(environment_path)
     for path in paths:
         try:
-            settings = json.loads(path.read_text(encoding="utf-8"))
+            # ``utf-8-sig`` transparently strips a UTF-8 BOM if one is
+            # present (PowerShell's ``Set-Content -Encoding UTF8`` writes a
+            # BOM, so plain ``utf-8`` would fail here and the override would
+            # be silently ignored -> mail would fall back to the default
+            # account, which is exactly the bug we are fixing).
+            settings = json.loads(path.read_text(encoding="utf-8-sig"))
         except (OSError, json.JSONDecodeError):
             continue
         sender_address = str(settings.get("outlook_sender_address", "")).strip()
