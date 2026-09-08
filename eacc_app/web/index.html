@@ -1,0 +1,524 @@
+<!DOCTYPE html>
+<html lang="ko">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1.0" />
+<title>E-Acc 법인카드 자동처리</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700;800&family=Noto+Sans+KR:wght@400;500;600;700&display=swap" rel="stylesheet">
+<style>
+  :root {
+    --bg-base: #0E141C;
+    --surface-1: #141C27;
+    --surface-2: #1B2530;
+    --surface-3: #212C39;
+    --border: #29343F;
+    --border-soft: #202A34;
+    --text-primary: #E9EEF4;
+    --text-secondary: #8D9AAA;
+    --text-faint: #5E6B7A;
+    --accent: #5B8DEF;
+    --accent-hover: #6F9BF2;
+    --accent-soft: rgba(91, 141, 239, 0.14);
+    --success: #34C77C;
+    --danger: #F0576B;
+    --warning: #F0A93A;
+    --info: #5FA8E0;
+    --radius-sm: 6px;
+    --radius-md: 10px;
+  }
+
+  * { box-sizing: border-box; }
+
+  html, body {
+    margin: 0;
+    height: 100%;
+    background: var(--bg-base);
+    color: var(--text-primary);
+    font-family: "Inter", "Noto Sans KR", -apple-system, sans-serif;
+    font-size: 13px;
+    -webkit-font-smoothing: antialiased;
+  }
+
+  .app-shell {
+    display: grid;
+    grid-template-columns: 216px 1fr;
+    min-height: 100vh;
+  }
+
+  /* ---------- Sidebar ---------- */
+  .sidebar {
+    background: var(--surface-1);
+    border-right: 1px solid var(--border);
+    display: flex;
+    flex-direction: column;
+    padding: 22px 0 18px;
+  }
+  .brand {
+    display: flex;
+    align-items: center;
+    gap: 10px;
+    padding: 0 20px 26px;
+    margin-bottom: 10px;
+    border-bottom: 1px solid var(--border-soft);
+  }
+  .brand-mark {
+    width: 30px; height: 30px;
+    border-radius: 8px;
+    background: linear-gradient(135deg, var(--accent), #3E63C4);
+    display: flex; align-items: center; justify-content: center;
+    font-weight: 800; font-size: 13px; color: white;
+    flex-shrink: 0;
+  }
+  .brand-text { line-height: 1.25; }
+  .brand-text .t1 { font-weight: 700; font-size: 14px; }
+  .brand-text .t2 { font-size: 11px; color: var(--text-faint); }
+
+  .nav-group-label {
+    font-size: 10.5px;
+    color: var(--text-faint);
+    letter-spacing: 0.03em;
+    padding: 4px 20px 8px;
+    margin-top: 6px;
+  }
+  .nav-item {
+    display: flex;
+    align-items: center;
+    gap: 10px;
+    padding: 9px 20px;
+    margin: 1px 10px;
+    border-radius: var(--radius-sm);
+    color: var(--text-secondary);
+    font-size: 12.5px;
+    font-weight: 500;
+    cursor: pointer;
+    transition: background 0.12s ease, color 0.12s ease;
+  }
+  .nav-item svg { flex-shrink: 0; opacity: 0.85; }
+  .nav-item:hover { background: var(--surface-2); color: var(--text-primary); }
+  .nav-item.active { background: var(--accent-soft); color: var(--accent); }
+  .nav-item.active svg { opacity: 1; }
+
+  .sidebar-footer {
+    margin-top: auto;
+    padding: 14px 20px 0;
+    border-top: 1px solid var(--border-soft);
+  }
+  .sidebar-footer .stage-tag {
+    display: inline-flex; align-items: center; gap: 6px;
+    font-size: 11px; color: var(--text-faint);
+  }
+  .sidebar-footer .dot { width: 6px; height: 6px; border-radius: 50%; background: var(--text-faint); }
+
+  /* ---------- Main ---------- */
+  .main { padding: 22px 28px 28px; min-width: 0; }
+
+  .header-row {
+    display: flex;
+    justify-content: space-between;
+    align-items: flex-start;
+    gap: 24px;
+    flex-wrap: wrap;
+  }
+  .header-title h1 { margin: 0 0 4px; font-size: 19px; font-weight: 700; letter-spacing: -0.01em; }
+  .header-title p { margin: 0; font-size: 12.5px; color: var(--text-secondary); max-width: 560px; line-height: 1.5; }
+
+  .header-actions { display: flex; flex-direction: column; align-items: flex-end; gap: 10px; }
+  .btn {
+    font-family: inherit; font-size: 12.5px; font-weight: 600;
+    border-radius: var(--radius-sm); padding: 9px 16px; border: 1px solid transparent;
+    cursor: pointer; display: inline-flex; align-items: center; gap: 7px;
+    transition: filter 0.12s ease, background 0.12s ease, opacity 0.12s ease;
+  }
+  .btn:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
+  .btn-primary { background: var(--accent); color: white; }
+  .btn-primary:hover { background: var(--accent-hover); }
+  .btn-primary:disabled { opacity: 0.55; cursor: not-allowed; }
+  .btn-ghost { background: transparent; color: var(--text-secondary); border-color: var(--border); }
+  .btn-ghost:hover { color: var(--text-primary); border-color: var(--text-faint); }
+
+  .login-inline {
+    display: flex; align-items: center; gap: 8px;
+    background: var(--surface-2); border: 1px solid var(--border);
+    border-radius: var(--radius-sm); padding: 6px 10px;
+  }
+  .login-inline label { font-size: 11px; color: var(--text-faint); }
+  .login-inline input {
+    background: var(--surface-3); border: 1px solid var(--border); border-radius: 5px;
+    color: var(--text-primary); font-size: 12px; padding: 5px 8px; width: 92px; font-family: inherit;
+  }
+  .login-inline input:focus-visible { outline: 2px solid var(--accent); outline-offset: 1px; }
+  .login-inline .hint { font-size: 10.5px; color: var(--text-faint); white-space: nowrap; }
+
+  .target-box {
+    margin-top: 16px; background: var(--surface-1); border: 1px solid var(--border);
+    border-radius: var(--radius-md); padding: 11px 16px; font-size: 12.5px;
+    color: var(--text-secondary);
+  }
+
+  .kpi-row {
+    margin-top: 18px; display: grid;
+    grid-template-columns: repeat(4, minmax(120px, 170px)) 1fr auto;
+    gap: 12px; align-items: stretch;
+  }
+  .kpi-card {
+    background: var(--surface-1); border: 1px solid var(--border);
+    border-top: 2px solid var(--kpi-color, var(--accent));
+    border-radius: var(--radius-md); padding: 13px 15px 11px;
+  }
+  .kpi-card .val { font-size: 24px; font-weight: 700; font-variant-numeric: tabular-nums; color: var(--kpi-color, var(--text-primary)); line-height: 1.1; }
+  .kpi-card .cap { margin-top: 5px; font-size: 11.5px; color: var(--text-secondary); }
+  .kpi-card.clickable { cursor: pointer; }
+  .kpi-card.clickable .cap { color: var(--kpi-color); }
+  .kpi-card.clickable:hover { border-color: var(--kpi-color); }
+
+  .stage-box {
+    background: var(--surface-1); border: 1px solid var(--border); border-radius: var(--radius-md);
+    padding: 13px 16px 11px; display: flex; flex-direction: column; justify-content: center; min-width: 200px;
+  }
+  .stage-box .cap { font-size: 11px; color: var(--text-faint); margin-bottom: 5px; }
+  .stage-box .now { font-size: 12.5px; color: var(--text-primary); font-weight: 500; }
+
+  .guide-link { align-self: center; font-size: 12px; color: var(--accent); cursor: pointer; white-space: nowrap; padding: 0 4px; }
+  .guide-link:hover { color: var(--accent-hover); text-decoration: underline; }
+
+  .toolbar-row { margin-top: 18px; display: flex; justify-content: space-between; align-items: center; }
+  .toolbar-row .note { font-size: 12px; color: var(--text-faint); }
+
+  .tabs { margin-top: 20px; display: flex; gap: 22px; border-bottom: 1px solid var(--border); }
+  .tab-btn {
+    background: none; border: none; font-family: inherit; color: var(--text-secondary);
+    font-size: 12.5px; font-weight: 500; padding: 0 2px 11px; cursor: pointer; position: relative;
+  }
+  .tab-btn:hover { color: var(--text-primary); }
+  .tab-btn.active { color: var(--text-primary); font-weight: 600; }
+  .tab-btn.active::after { content: ""; position: absolute; left: 0; right: 0; bottom: -1px; height: 2px; background: var(--accent); border-radius: 2px; }
+
+  .tab-panel { display: none; margin-top: 14px; }
+  .tab-panel.active { display: block; }
+
+  .filter-banner {
+    display: flex; align-items: center; gap: 10px;
+    background: var(--accent-soft); border: 1px solid var(--accent);
+    color: var(--accent); font-size: 12px; border-radius: var(--radius-sm);
+    padding: 7px 12px; margin-bottom: 10px;
+  }
+  .filter-banner button {
+    background: none; border: 1px solid var(--accent); color: var(--accent);
+    border-radius: 5px; font-size: 11px; padding: 2px 8px; cursor: pointer; font-family: inherit;
+  }
+
+  .table-scroll {
+    border: 1px solid var(--border); border-radius: var(--radius-md);
+    overflow: auto; max-height: 460px; background: var(--surface-1);
+  }
+  table { border-collapse: collapse; width: max-content; min-width: 100%; }
+  thead th {
+    position: sticky; top: 0; background: var(--surface-2); text-align: left;
+    font-size: 11px; font-weight: 600; color: var(--text-secondary);
+    padding: 9px 14px; white-space: nowrap; border-bottom: 1px solid var(--border); z-index: 1;
+  }
+  tbody td { padding: 8px 14px; white-space: nowrap; font-size: 12px; border-bottom: 1px solid var(--border-soft); color: var(--text-primary); }
+  tbody tr { cursor: pointer; }
+  tbody tr:hover td { background: var(--surface-2); }
+  tbody tr.selected td { background: var(--accent-soft); }
+  tbody tr:nth-child(even) td { background: rgba(255,255,255,0.012); }
+  td.num { font-variant-numeric: tabular-nums; text-align: right; }
+  td.center { text-align: center; }
+  .empty-row td { color: var(--text-faint); text-align: center; padding: 24px; }
+
+  .status-pill { display: inline-flex; align-items: center; gap: 6px; font-size: 11.5px; font-weight: 500; }
+  .status-pill .dot { width: 6px; height: 6px; border-radius: 50%; flex-shrink: 0; }
+  .status-pill.success { color: var(--success); } .status-pill.success .dot { background: var(--success); }
+  .status-pill.danger { color: var(--danger); } .status-pill.danger .dot { background: var(--danger); }
+  .status-pill.warning { color: var(--warning); } .status-pill.warning .dot { background: var(--warning); }
+  .status-pill.info { color: var(--info); } .status-pill.info .dot { background: var(--info); }
+
+  .table-footer { margin-top: 10px; display: flex; justify-content: space-between; font-size: 11.5px; color: var(--text-faint); }
+</style>
+</head>
+<body>
+
+<div class="app-shell">
+  <aside class="sidebar">
+    <div class="brand">
+      <div class="brand-mark">EA</div>
+      <div class="brand-text"><div class="t1">E-Acc</div><div class="t2">법인카드 자동처리</div></div>
+    </div>
+    <div class="nav-group-label">메뉴</div>
+    <div class="nav-item active">
+      <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="3" y="4" width="18" height="16" rx="2"/><path d="M3 9h18"/></svg>
+      <span>미상신 건 수</span>
+    </div>
+    <div class="nav-item" onclick="openMailWindow()">
+      <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="3" y="5" width="18" height="14" rx="2"/><path d="M3 7l9 6 9-6"/></svg>
+      <span>메일발송 (미처리 건 수)</span>
+    </div>
+    <div class="sidebar-footer">
+      <span class="stage-tag"><span class="dot"></span>한 건씩 처리 · 1단계</span>
+    </div>
+  </aside>
+
+  <main class="main">
+    <div class="header-row">
+      <div class="header-title">
+        <h1>미상신내역 행 단위 검증</h1>
+        <p>e-Acc에서 한 건씩 결재합니다. 프로그램은 선택 행의 검증·결과 이력·목록 재조회를 보조합니다.</p>
+      </div>
+      <div class="header-actions">
+        <button class="btn btn-primary" id="startBtn" onclick="startProcessing()">
+          <svg width="14" height="14" viewBox="0 0 24 24" fill="currentColor"><path d="M8 5v14l11-7z"/></svg>
+          자동 처리 시작
+        </button>
+        <div class="login-inline">
+          <label>아이디</label><input type="text" id="loginId" />
+          <label>비밀번호</label><input type="password" id="loginPw" />
+          <span class="hint">입력값은 저장하지 않습니다</span>
+        </div>
+      </div>
+    </div>
+
+    <div class="target-box" id="targetText">현재 e-Acc 처리대상 · 아직 읽지 않음</div>
+
+    <div class="kpi-row">
+      <div class="kpi-card" style="--kpi-color:var(--accent)">
+        <div class="val" id="kpi-target">0</div><div class="cap">처리대상</div>
+      </div>
+      <div class="kpi-card clickable" style="--kpi-color:var(--success)" onclick="filterResult('completed')">
+        <div class="val" id="kpi-completed">0</div><div class="cap">처리완료</div>
+      </div>
+      <div class="kpi-card clickable" style="--kpi-color:var(--danger)" onclick="filterResult('exception')">
+        <div class="val" id="kpi-exception">0</div><div class="cap">예외처리</div>
+      </div>
+      <div class="kpi-card clickable" style="--kpi-color:var(--warning)" onclick="filterResult('pg_pending')">
+        <div class="val" id="kpi-pgwait">0</div><div class="cap">PG 등록 대기</div>
+      </div>
+      <div class="stage-box">
+        <div class="cap">현재 단계</div>
+        <div class="now" id="stageText">자동 처리 시작 전</div>
+      </div>
+      <div class="guide-link" onclick="callApi('show_guide')">법인카드 검증 기준 →</div>
+    </div>
+
+    <div class="toolbar-row">
+      <span class="note">정상 일반 행은 검증 후 결재요청까지 자동 진행합니다.</span>
+      <button class="btn btn-ghost" onclick="callApi('register_merchant')">PG 실구매처 등록</button>
+    </div>
+
+    <div class="tabs" id="tabBar"></div>
+    <div id="tabPanels"></div>
+
+    <div class="table-footer">
+      <span id="statusText">자동 처리 시작을 눌러 e-Acc의 첫 행을 읽어 주세요.</span>
+      <span id="syncedAtText" style="color: var(--text-faint);">Python 연결 대기 중...</span>
+    </div>
+  </main>
+</div>
+
+<script>
+/* ---------- pywebview 연결 ---------- */
+function callApi(method, ...args) {
+  if (window.pywebview && window.pywebview.api && window.pywebview.api[method]) {
+    return window.pywebview.api[method](...args);
+  }
+  return Promise.resolve();
+}
+
+function sendLoginFields() {
+  const id = document.getElementById('loginId').value;
+  const pw = document.getElementById('loginPw').value;
+  if (id || pw) callApi('set_login', id, pw);
+  document.getElementById('loginId').value = '';
+  document.getElementById('loginPw').value = '';
+}
+
+function startProcessing() {
+  sendLoginFields();
+  callApi('start_processing');
+}
+
+function openMailWindow() {
+  // "메일발송"도 로그인 입력값이 필요하므로, 자동 처리 시작과 똑같이
+  // 먼저 파이썬으로 아이디/비밀번호를 넘긴 다음 실행한다.
+  sendLoginFields();
+  callApi('open_mail_window');
+}
+
+function selectRow(tabId, rowId) {
+  callApi('select_row', tabId, rowId);
+  document.querySelectorAll(`#panel-${tabId} tbody tr`).forEach(tr => {
+    tr.classList.toggle('selected', tr.dataset.rowId === rowId);
+  });
+}
+
+/* ---------- 탭/표 정의 ---------- */
+const TAB_DEFS = {
+  transactions: {
+    label: "실시간_전표처리",
+    columns: ["행","가져오기상태","내부거래ID","처리결과","영수증판정","영수증사유","계정검증","검증근거","PG조회","사업자번호","비즈노상호","실구매처등록","카드번호","카드소지자","승인번호","적요","거래처","사용금액","계정명","코스트센터","오류사유"],
+    badgeCol: "가져오기상태",
+    tagMap: { "신규": "success", "중복": "warning", "오류": "danger", "현재": "info" },
+  },
+  results: {
+    label: "자동_처리결과",
+    columns: ["처리시간","승인번호","증빙일자","사용금액","계정명","거래처","영수증 검증","계정 검증","PG 처리","결재 처리","최종 결과","핵심 사유","내부거래ID"],
+    badgeCol: "최종 결과",
+    tagMap: { "결과-예외처리": "danger", "결과-PG등록대기": "warning", "결과-처리대상": "info" },
+    defaultBadgeClass: "success",
+  },
+  mail: {
+    label: "Mail_발송_Log",
+    columns: ["처리시간","성명","이메일","대상 건수","메일 제목","상태","상세 사유"],
+    badgeCol: "상태",
+    tagMap: { "mail-error": "danger", "mail-warning": "warning" },
+    defaultBadgeClass: "success",
+  },
+  processing: {
+    label: "자동_전표처리_Log",
+    columns: ["시각","상태","승인번호","증빙일자","금액","거래처","사유","내부거래ID"],
+    badgeCol: "상태",
+    textClassify: (text) => {
+      if (text.includes("실패") || text.includes("오류")) return "danger";
+      if (text.includes("진행") || text.includes("대기")) return "warning";
+      if (text.includes("완료")) return "success";
+      return null;
+    },
+  },
+  export: {
+    label: "e-Acc DB Export",
+    columns: ["작업번호","가져온시각","파일명","전체","신규","중복","오류"],
+  },
+};
+const NUMERIC_COLS = new Set(["사용금액","금액","전체","신규","중복","오류","대상 건수"]);
+const CENTER_COLS = new Set(["행","가져오기상태","영수증판정","계정검증","PG조회","실구매처등록"]);
+
+let tableData = { transactions: [], results: [], mail: [], processing: [], export: [] };
+let selectedRowByTab = {};
+let resultFilter = null; // "처리 완료" | "예외처리" | "PG 등록 대기" | null
+const FILTER_TEXT = { completed: "처리 완료", exception: "예외처리", pg_pending: "PG 등록 대기" };
+
+function badgeClassFor(tabId, tags, text) {
+  const def = TAB_DEFS[tabId];
+  if (def.tagMap) {
+    for (const tag of tags) {
+      if (def.tagMap[tag]) return def.tagMap[tag];
+    }
+    if (def.defaultBadgeClass) return def.defaultBadgeClass;
+  }
+  if (def.textClassify) {
+    const cls = def.textClassify(text || "");
+    if (cls) return cls;
+  }
+  return null;
+}
+
+function renderCell(tabId, colName, value, tags) {
+  const text = value === undefined || value === null ? "" : String(value);
+  if (colName === TAB_DEFS[tabId].badgeCol) {
+    const cls = badgeClassFor(tabId, tags || [], text);
+    if (cls) {
+      return `<td><span class="status-pill ${cls}"><span class="dot"></span>${text}</span></td>`;
+    }
+    return `<td>${text}</td>`;
+  }
+  if (NUMERIC_COLS.has(colName)) {
+    const num = Number(String(text).replace(/,/g, ""));
+    const display = Number.isFinite(num) && text !== "" ? num.toLocaleString("ko-KR") : text;
+    return `<td class="num">${display}</td>`;
+  }
+  const cls = CENTER_COLS.has(colName) ? ' class="center"' : "";
+  return `<td${cls}>${text}</td>`;
+}
+
+function buildTabsUI() {
+  const tabBar = document.getElementById("tabBar");
+  const panels = document.getElementById("tabPanels");
+  tabBar.innerHTML = "";
+  panels.innerHTML = "";
+  Object.keys(TAB_DEFS).forEach((tabId, i) => {
+    const def = TAB_DEFS[tabId];
+    const btn = document.createElement("button");
+    btn.className = "tab-btn" + (i === 0 ? " active" : "");
+    btn.textContent = def.label;
+    btn.onclick = () => switchTab(tabId);
+    btn.dataset.tabId = tabId;
+    tabBar.appendChild(btn);
+
+    const panel = document.createElement("div");
+    panel.className = "tab-panel" + (i === 0 ? " active" : "");
+    panel.id = "panel-" + tabId;
+    panels.appendChild(panel);
+  });
+}
+
+function switchTab(tabId) {
+  document.querySelectorAll(".tab-btn").forEach(b => b.classList.toggle("active", b.dataset.tabId === tabId));
+  document.querySelectorAll(".tab-panel").forEach(p => p.classList.toggle("active", p.id === "panel-" + tabId));
+}
+
+function clearFilter() {
+  resultFilter = null;
+  renderTable("results");
+}
+
+function filterResult(kind) {
+  resultFilter = FILTER_TEXT[kind];
+  switchTab("results");
+  renderTable("results");
+}
+
+function renderTable(tabId) {
+  const def = TAB_DEFS[tabId];
+  const panel = document.getElementById("panel-" + tabId);
+  let rows = tableData[tabId] || [];
+
+  let banner = "";
+  if (tabId === "results" && resultFilter) {
+    const visibleCount = rows.filter(r => String(r.values[def.columns.indexOf(def.badgeCol)]) === resultFilter).length;
+    banner = `<div class="filter-banner">필터: ${resultFilter} (${visibleCount}건) <button onclick="clearFilter()">해제</button></div>`;
+    rows = rows.filter(r => String(r.values[def.columns.indexOf(def.badgeCol)]) === resultFilter);
+  }
+
+  const thead = "<thead><tr>" + def.columns.map(c => `<th>${c}</th>`).join("") + "</tr></thead>";
+  let bodyHtml;
+  if (rows.length === 0) {
+    bodyHtml = `<tbody><tr class="empty-row"><td colspan="${def.columns.length}">표시할 데이터가 없습니다.</td></tr></tbody>`;
+  } else {
+    bodyHtml = "<tbody>" + rows.map(row => {
+      const cells = def.columns.map((col, idx) => renderCell(tabId, col, row.values[idx], row.tags)).join("");
+      const selected = selectedRowByTab[tabId] === row.id ? " selected" : "";
+      return `<tr class="${selected.trim()}" data-row-id="${row.id}" onclick="selectRow('${tabId}','${row.id}')">${cells}</tr>`;
+    }).join("") + "</tbody>";
+  }
+  panel.innerHTML = banner + `<div class="table-scroll"><table>${thead}${bodyHtml}</table></div>`;
+}
+
+function renderAllTables() {
+  Object.keys(TAB_DEFS).forEach(renderTable);
+}
+
+/* ---------- 파이썬(tkinter)에서 상태가 올 때마다 호출됨 ---------- */
+function updateState(state) {
+  document.getElementById('kpi-target').textContent = state.kpi['처리대상'] ?? '0';
+  document.getElementById('kpi-completed').textContent = state.kpi['처리 완료'] ?? '0';
+  document.getElementById('kpi-exception').textContent = state.kpi['예외처리'] ?? '0';
+  document.getElementById('kpi-pgwait').textContent = state.kpi['PG 등록 대기'] ?? '0';
+  document.getElementById('targetText').textContent = state.currentTarget || "";
+  document.getElementById('stageText').textContent = state.currentStage || "";
+  document.getElementById('statusText').textContent = state.statusMessage || "";
+  document.getElementById('startBtn').disabled = !!state.busy;
+  if (state.syncedAt) {
+    document.getElementById('syncedAtText').textContent = "마지막 동기화: " + state.syncedAt;
+  }
+
+  tableData = state.tables || tableData;
+  renderAllTables();
+}
+window.updateState = updateState;
+
+buildTabsUI();
+renderAllTables();
+</script>
+
+</body>
+</html>

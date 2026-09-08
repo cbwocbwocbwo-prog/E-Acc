@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import json
 import os
 import threading
 import tkinter as tk
@@ -9,8 +8,6 @@ from datetime import datetime
 from pathlib import Path
 from tkinter import filedialog, font as tkfont, messagebox, ttk
 
-import ttkbootstrap as tb
-import webview
 from PIL import Image, ImageTk
 
 from .account_validation import AccountValidationResult, validate_account_rules
@@ -50,28 +47,6 @@ from .storage import ImportRepository
 
 
 APP_TITLE = "E-Acc 법인카드 자동처리"
-
-# 화면 전체에서 재사용하는 색상 팔레트. 예전에는 같은 의미의 색(예: 파란색 강조,
-# 빨간색 경고)이 여러 곳에 조금씩 다른 헥스코드로 흩어져 있었는데, 여기 한 곳에
-# 모아두면 색이 미묘하게 어긋나는 일이 없고 나중에 톤을 바꿀 때도 여기만 고치면 된다.
-PALETTE = {
-    "navy": "#1B2B3A",
-    "navy_hover": "#25384A",
-    "navy_text_muted": "#93A3B3",
-    "navy_text_dim": "#B9C5D0",
-    "accent": "#1D5E9E",
-    "accent_hover": "#2E71B4",
-    "text_muted": "#5B6470",
-    "text_faint": "#606A75",
-    "success_fg": "#2A6B1F",
-    "success_bg": "#E7F5E1",
-    "danger_fg": "#A61B1B",
-    "danger_bg": "#FDECEC",
-    "warning_fg": "#9A5700",
-    "warning_bg": "#FFF1DA",
-    "info_fg": "#1D5E9E",
-    "info_bg": "#E8F3FF",
-}
 # 거래내역의 '처리결과'는 영수증 OCR·PG 조회와 구분된 결재 처리 상태만 표시한다.
 APPROVAL_RESULT_STATUSES = frozenset(
     {
@@ -91,60 +66,9 @@ def default_database_path() -> Path:
     return base / "EAccAutomation" / "eacc.db"
 
 
-def _tree_snapshot(tree: ttk.Treeview) -> list[dict]:
-    """Treeview 하나를 웹 화면에 보낼 수 있는 JSON 친화적인 목록으로 바꾼다.
-    표에 이미 들어있는 값과 태그를 그대로 읽기만 하므로, 표를 채우는
-    기존 로직은 건드리지 않는다."""
-    rows = []
-    for iid in tree.get_children():
-        rows.append(
-            {
-                "id": iid,
-                "values": list(tree.item(iid, "values")),
-                "tags": list(tree.item(iid, "tags")),
-            }
-        )
-    return rows
-
-
-def _bring_toplevel_forward(window: tk.Misc) -> None:
-    """메인 화면이 웹(pywebview) 창으로 바뀌면서, 새로 뜨는 tkinter 팝업/안내창이
-    pywebview 창 뒤에 숨어 "안 뜨는 것"처럼 보일 수 있다. 잠깐 최상단으로
-    올려서 확실히 화면 앞으로 나오게 한다."""
-    try:
-        window.lift()
-        window.attributes("-topmost", True)
-        window.after(200, lambda: window.attributes("-topmost", False))
-        window.focus_force()
-    except Exception:
-        pass
-
-
-def _forwarding_messagebox(original):
-    """messagebox.showinfo/showerror/... 를 감싸서, 창을 띄우기 직전에
-    parent(대개 숨겨둔 tkinter 루트)를 잠깐 최상단으로 올린다. 호출부
-    (23곳 넘게 흩어져 있는 messagebox.* 호출) 자체는 전혀 바꾸지 않는다."""
-
-    def _wrapped(*args, **kwargs):
-        parent = kwargs.get("parent")
-        if parent is not None:
-            _bring_toplevel_forward(parent)
-        return original(*args, **kwargs)
-
-    return _wrapped
-
-
-messagebox.showinfo = _forwarding_messagebox(messagebox.showinfo)
-messagebox.showerror = _forwarding_messagebox(messagebox.showerror)
-messagebox.showwarning = _forwarding_messagebox(messagebox.showwarning)
-messagebox.askyesno = _forwarding_messagebox(messagebox.askyesno)
-
-
-class EAccApplication(tb.Window):
+class EAccApplication(tk.Tk):
     def __init__(self, repository: ImportRepository | None = None) -> None:
-        # "flatly"는 ttkbootstrap이 제공하는 밝고 깔끔한 플랫 테마로, 버튼·입력창·
-        # 스크롤바·탭 등 ttk 위젯 전반의 기본 모양을 한 번에 현대적으로 바꿔준다.
-        super().__init__(themename="flatly")
+        super().__init__()
         self.title(f"{APP_TITLE} - 3단계 개발 테스트")
         self.geometry("1480x860")
         self.minsize(1100, 650)
@@ -207,57 +131,38 @@ class EAccApplication(tb.Window):
         self.protocol("WM_DELETE_WINDOW", self._on_close)
 
     def _configure_styles(self) -> None:
-        # tb.Window가 생성 시점에 이미 "flatly" 테마의 Style 객체를 만들어 두므로,
-        # 새로 만들지 않고 그 위에 우리 앱만의 스타일을 얹는다.
-        style = self.style
+        style = ttk.Style(self)
+        if "vista" in style.theme_names():
+            style.theme_use("vista")
         style.configure("Title.TLabel", font=("맑은 고딕", 18, "bold"))
-        style.configure("Subtitle.TLabel", font=("맑은 고딕", 10), foreground=PALETTE["text_muted"])
-        style.configure("CardCaption.TLabel", font=("맑은 고딕", 9), foreground=PALETTE["text_faint"])
+        style.configure("Subtitle.TLabel", font=("맑은 고딕", 10), foreground="#5B6470")
+        style.configure("CardValue.TLabel", font=("맑은 고딕", 20, "bold"))
+        style.configure("CardCaption.TLabel", font=("맑은 고딕", 9), foreground="#606A75")
+        style.configure(
+            "DashboardFilter.TLabel",
+            font=("맑은 고딕", 9, "underline"),
+            foreground="#1D5E9E",
+        )
         style.configure(
             "GuideLink.TLabel",
             font=("맑은 고딕", 10, "underline"),
-            foreground=PALETTE["accent"],
+            foreground="#1D5E9E",
         )
         style.configure("Accent.TButton", font=("맑은 고딕", 10, "bold"), padding=(14, 8))
         style.configure("Treeview", rowheight=27, font=("맑은 고딕", 9))
         style.configure("Treeview.Heading", font=("맑은 고딕", 9, "bold"))
-        style.configure("TNotebook.Tab", font=("맑은 고딕", 10), padding=(16, 8))
-
-        # 대시보드 KPI 카드: 예전에는 배경 없이 숫자만 놓여 있었는데, 상태별로
-        # 옅은 색 배경을 깐 카드로 바꿔서 한눈에 어디를 봐야 하는지 보이게 한다.
-        # ("처리 완료"=초록, "예외처리"=빨강, "PG 등록 대기"=주황, 그 외=중립)
-        card_tones = {
-            "Neutral": (PALETTE["accent"], "#FFFFFF"),
-            "Success": (PALETTE["success_fg"], PALETTE["success_bg"]),
-            "Danger": (PALETTE["danger_fg"], PALETTE["danger_bg"]),
-            "Warning": (PALETTE["warning_fg"], PALETTE["warning_bg"]),
-        }
-        for tone, (fg, bg) in card_tones.items():
-            style.configure(f"{tone}Card.TFrame", background=bg)
-            style.configure(
-                f"{tone}CardValue.TLabel", font=("맑은 고딕", 21, "bold"), foreground=fg, background=bg
-            )
-            style.configure(
-                f"{tone}CardCaption.TLabel", font=("맑은 고딕", 9), foreground=fg, background=bg
-            )
-            style.configure(
-                f"{tone}CardCaptionLink.TLabel",
-                font=("맑은 고딕", 9, "underline"),
-                foreground=fg,
-                background=bg,
-            )
 
     def _build_layout(self) -> None:
         root = ttk.Frame(self)
         root.pack(fill="both", expand=True)
 
-        sidebar = tk.Frame(root, bg=PALETTE["navy"], width=185)
+        sidebar = tk.Frame(root, bg="#263746", width=185)
         sidebar.pack(side="left", fill="y")
         sidebar.pack_propagate(False)
         tk.Label(
             sidebar,
             text="E-Acc\n자동처리",
-            bg=PALETTE["navy"],
+            bg="#263746",
             fg="white",
             font=("맑은 고딕", 17, "bold"),
             justify="left",
@@ -265,54 +170,36 @@ class EAccApplication(tb.Window):
         self.unsubmitted_menu_button = tk.Button(
             sidebar,
             text="미상신 건 수",
-            bg=PALETTE["accent"],
+            bg="#3D79B8",
             fg="white",
-            activebackground=PALETTE["accent_hover"],
+            activebackground="#4B89C9",
             activeforeground="white",
             relief="flat",
             font=("맑은 고딕", 11, "bold"),
             anchor="w",
             padx=20,
             pady=12,
-            cursor="arrow",
         )
         self.unsubmitted_menu_button.pack(fill="x")
         self.unprocessed_mail_button = tk.Button(
             sidebar,
             text="메일발송(미처리 건 수)",
-            bg=PALETTE["navy"],
-            fg=PALETTE["navy_text_muted"],
-            disabledforeground=PALETTE["navy_text_muted"],
-            activebackground=PALETTE["navy_hover"],
-            activeforeground="white",
+            bg="#263746",
+            fg="#93A3B3",
+            disabledforeground="#93A3B3",
             relief="flat",
             command=self._run_unprocessed_mail_process,
             font=("맑은 고딕", 10),
             anchor="w",
             padx=20,
             pady=12,
-            cursor="hand2",
         )
         self.unprocessed_mail_button.pack(fill="x")
-        # 마우스를 올렸을 때만 살짝 밝아지는 hover 효과 — 클릭 가능한 항목이라는
-        # 느낌을 주는 작은 디테일이다. 버튼이 비활성 상태일 때는 무시한다.
-        self.unprocessed_mail_button.bind(
-            "<Enter>",
-            lambda _e: self.unprocessed_mail_button.configure(bg=PALETTE["navy_hover"])
-            if str(self.unprocessed_mail_button["state"]) == "normal"
-            else None,
-        )
-        self.unprocessed_mail_button.bind(
-            "<Leave>",
-            lambda _e: self.unprocessed_mail_button.configure(bg=PALETTE["navy"])
-            if str(self.unprocessed_mail_button["state"]) == "normal"
-            else None,
-        )
         tk.Label(
             sidebar,
             text="한 건씩 처리 · 1단계",
-            bg=PALETTE["navy"],
-            fg=PALETTE["navy_text_dim"],
+            bg="#263746",
+            fg="#B9C5D0",
             font=("맑은 고딕", 9),
         ).pack(side="bottom", anchor="w", padx=20, pady=22)
 
@@ -373,19 +260,10 @@ class EAccApplication(tb.Window):
             "예외처리": tk.StringVar(value="0"),
             "PG 등록 대기": tk.StringVar(value="0"),
         }
-        # 카드마다 상태에 맞는 색을 입혀서(초록=완료, 빨강=예외처리, 주황=PG 대기)
-        # 숫자만 나열되어 있던 예전보다 한눈에 어디를 봐야 하는지 알 수 있게 한다.
-        card_tones = {
-            "처리대상": "Neutral",
-            "처리 완료": "Success",
-            "예외처리": "Danger",
-            "PG 등록 대기": "Warning",
-        }
         for index, (caption, variable) in enumerate(self.session_vars.items()):
-            tone = card_tones[caption]
-            card = ttk.Frame(dashboard, style=f"{tone}Card.TFrame", padding=(14, 10))
-            card.grid(row=0, column=index, padx=(0, 12), sticky="w")
-            ttk.Label(card, textvariable=variable, style=f"{tone}CardValue.TLabel").pack(anchor="w")
+            card = ttk.Frame(dashboard)
+            card.grid(row=0, column=index, padx=(0, 34), sticky="w")
+            ttk.Label(card, textvariable=variable, style="CardValue.TLabel").pack(anchor="w")
             result_filter = {
                 "처리 완료": "completed",
                 "예외처리": "exception",
@@ -394,7 +272,7 @@ class EAccApplication(tb.Window):
             caption_label = ttk.Label(
                 card,
                 text="처리완료" if caption == "처리 완료" else caption,
-                style=f"{tone}CardCaptionLink.TLabel" if result_filter else f"{tone}CardCaption.TLabel",
+                style="DashboardFilter.TLabel" if result_filter else "CardCaption.TLabel",
                 cursor="hand2" if result_filter else "",
             )
             caption_label.pack(anchor="w")
@@ -541,10 +419,10 @@ class EAccApplication(tb.Window):
             self.transactions_tree.heading(column, text=column)
             anchor = "e" if column == "사용금액" else "center" if column in {"행", "가져오기상태"} else "w"
             self.transactions_tree.column(column, width=widths.get(column, 110), minwidth=55, anchor=anchor)
-        self.transactions_tree.tag_configure("신규", background=PALETTE["success_bg"])
-        self.transactions_tree.tag_configure("중복", background=PALETTE["warning_bg"])
-        self.transactions_tree.tag_configure("오류", background=PALETTE["danger_bg"])
-        self.transactions_tree.tag_configure("현재", background=PALETTE["info_bg"])
+        self.transactions_tree.tag_configure("신규", background="#EFF8F1")
+        self.transactions_tree.tag_configure("중복", background="#FFF7E8")
+        self.transactions_tree.tag_configure("오류", background="#FDECEC")
+        self.transactions_tree.tag_configure("현재", background="#E8F3FF")
 
     def _build_history_table(self, parent: ttk.Frame) -> None:
         columns = ("작업번호", "가져온시각", "파일명", "전체", "신규", "중복", "오류")
@@ -598,12 +476,8 @@ class EAccApplication(tb.Window):
         for column in columns:
             self.mail_log_tree.heading(column, text=column)
             self.mail_log_tree.column(column, width=widths[column], anchor="center" if column in {"처리시간", "성명", "대상 건수", "상태"} else "w")
-        self.mail_log_tree.tag_configure(
-            "mail-error", foreground=PALETTE["danger_fg"], background=PALETTE["danger_bg"]
-        )
-        self.mail_log_tree.tag_configure(
-            "mail-warning", foreground=PALETTE["warning_fg"], background=PALETTE["warning_bg"]
-        )
+        self.mail_log_tree.tag_configure("mail-error", foreground="#A61B1B", background="#FDECEC")
+        self.mail_log_tree.tag_configure("mail-warning", foreground="#9A5700", background="#FFF1DA")
 
     def _build_processing_results_table(self, parent: ttk.Frame) -> None:
         columns = (
@@ -655,13 +529,13 @@ class EAccApplication(tb.Window):
         # 처리 완료 행은 기본 흰색으로 두고, 사용자의 확인·조치가 필요한
         # 결과만 행 전체의 옅은 배경과 진한 글자색으로 눈에 띄게 한다.
         self.processing_results_tree.tag_configure(
-            "결과-예외처리", foreground=PALETTE["danger_fg"], background=PALETTE["danger_bg"]
+            "결과-예외처리", foreground="#A61B1B", background="#FDECEC"
         )
         self.processing_results_tree.tag_configure(
-            "결과-PG등록대기", foreground=PALETTE["warning_fg"], background=PALETTE["warning_bg"]
+            "결과-PG등록대기", foreground="#9A5700", background="#FFF1DA"
         )
         self.processing_results_tree.tag_configure(
-            "결과-처리대상", foreground=PALETTE["accent"], background=PALETTE["info_bg"]
+            "결과-처리대상", foreground="#1D5E9E", background="#ECF5FE"
         )
 
     def _choose_file(self) -> None:
@@ -1655,7 +1529,6 @@ class EAccApplication(tb.Window):
         viewer.title(f"영수증 {validation.status} - {result.transaction_id}")
         viewer.geometry("960x840")
         viewer.minsize(600, 500)
-        _bring_toplevel_forward(viewer)
         ttk.Label(
             viewer,
             text=f"원본 {len(result.image_paths)}장 · DocIRN {', '.join(result.doc_irns)} · CorpNo {result.corp_no}",
@@ -1766,12 +1639,8 @@ class EAccApplication(tb.Window):
         for column in columns:
             self.unprocessed_tree.heading(column, text=column)
             self.unprocessed_tree.column(column, width=widths[column], anchor="center" if column not in {"부서", "가맹점", "수신자 상태"} else "w")
-        self.unprocessed_tree.tag_configure(
-            "recipient-error", foreground=PALETTE["danger_fg"], background=PALETTE["danger_bg"]
-        )
-        self.unprocessed_tree.tag_configure(
-            "recipient-warning", foreground=PALETTE["warning_fg"], background=PALETTE["warning_bg"]
-        )
+        self.unprocessed_tree.tag_configure("recipient-error", foreground="#A61B1B", background="#FDECEC")
+        self.unprocessed_tree.tag_configure("recipient-warning", foreground="#9A5700", background="#FFF1DA")
 
     def _collect_unprocessed_card_uses(self) -> None:
         self.unprocessed_fetch_button.configure(state="disabled")
@@ -2288,7 +2157,8 @@ class EAccApplication(tb.Window):
         existing = getattr(self, "_criteria_window", None)
         if existing is not None and existing.winfo_exists():
             existing.deiconify()
-            _bring_toplevel_forward(existing)
+            existing.lift()
+            existing.focus_force()
             return "break"
 
         window = tk.Toplevel(self)
@@ -2297,7 +2167,6 @@ class EAccApplication(tb.Window):
         window.geometry("1120x455")
         window.minsize(900, 330)
         window.transient(self)
-        _bring_toplevel_forward(window)
 
         content = ttk.Frame(window, padding=(18, 16))
         content.pack(fill="both", expand=True)
@@ -2335,156 +2204,13 @@ class EAccApplication(tb.Window):
         window.protocol("WM_DELETE_WINDOW", window.destroy)
         return "break"
 
-    # ------------------------------------------------------------------
-    # 웹(pywebview) 화면과의 연결. 아래 메서드들은 기존 tkinter 위젯의
-    # 상태(StringVar, Treeview 내용)를 "읽기"만 하고, 새로운 자동화 로직은
-    # 전혀 추가하지 않는다. 실제 버튼 동작은 EAccWebApi가 기존 메서드를
-    # 그대로 호출해서 처리한다.
-    # ------------------------------------------------------------------
-    def _start_web_sync(self, window: "webview.Window") -> None:
-        self._web_window = window
-        self.after(0, self._push_web_state)
-
-    def _push_web_state(self) -> None:
-        window = getattr(self, "_web_window", None)
-        if window is not None:
-            try:
-                state = self._build_web_state()
-                window.evaluate_js(f"window.updateState({json.dumps(state, ensure_ascii=False)})")
-            except Exception:
-                # 화면 갱신이 한 번 실패해도 프로그램은 계속 돌아가야 하지만,
-                # 원인을 알 수 있게 콘솔(run_app.bat 창)에는 남겨둔다.
-                import traceback
-
-                traceback.print_exc()
-        self.after(400, self._push_web_state)
-
-    def _build_web_state(self) -> dict:
-        busy = str(self.current_target_button["state"]) == "disabled"
-        return {
-            "kpi": {key: var.get() for key, var in self.session_vars.items()},
-            "currentTarget": self.current_target_message.get(),
-            "currentStage": self.current_stage_var.get(),
-            "statusMessage": self.status_message.get(),
-            "busy": busy,
-            "syncedAt": datetime.now().strftime("%H:%M:%S"),
-            "tables": {
-                "transactions": _tree_snapshot(self.transactions_tree),
-                "results": _tree_snapshot(self.processing_results_tree),
-                "mail": _tree_snapshot(self.mail_log_tree),
-                "processing": _tree_snapshot(self.processing_tree),
-                "export": _tree_snapshot(self.history_tree),
-            },
-        }
-
     def _on_close(self) -> None:
         self.browser_service.close()
         self.destroy()
 
 
-class EAccWebApi:
-    """웹 화면(JS)에서 pywebview.api.xxx()로 호출하는 다리 역할만 한다.
-    실제 처리는 전부 EAccApplication의 기존 메서드에 그대로 위임하므로,
-    자동화 로직 자체는 한 줄도 새로 만들지 않는다.
-
-    tkinter는 자신의 메인루프 스레드에서만 위젯을 건드려야 안전하므로,
-    pywebview 쪽에서 걸려온 호출은 항상 self._app.after(0, ...)를 거쳐
-    tkinter 메인루프로 넘긴다. 이건 이 파일이 원래부터 브라우저 자동화
-    콜백에 쓰던 것과 동일한 패턴이다.
-    """
-
-    _TREE_ATTRS = {
-        "transactions": "transactions_tree",
-        "results": "processing_results_tree",
-        "mail": "mail_log_tree",
-        "processing": "processing_tree",
-        "export": "history_tree",
-    }
-
-    def __init__(self, app: EAccApplication) -> None:
-        self._app = app
-
-    def set_login(self, user_id: str, password: str) -> None:
-        def _apply() -> None:
-            self._app.login_id.set(user_id or "")
-            self._app.login_password.set(password or "")
-
-        self._app.after(0, _apply)
-
-    def start_processing(self) -> None:
-        self._app.after(0, self._app._read_current_first_target)
-
-    def register_merchant(self) -> None:
-        self._app.after(0, self._app._register_selected_actual_merchant)
-
-    def show_guide(self) -> None:
-        self._app.after(0, self._app._show_validation_criteria)
-
-    def open_mail_window(self) -> None:
-        self._app.after(0, self._app._run_unprocessed_mail_process)
-
-    def select_row(self, table: str, row_id: str) -> None:
-        attr = self._TREE_ATTRS.get(table)
-        if not attr:
-            return
-
-        def _select() -> None:
-            tree = getattr(self._app, attr, None)
-            if tree is not None and tree.exists(row_id):
-                tree.selection_set(row_id)
-                tree.focus(row_id)
-
-        self._app.after(0, _select)
-
-
 def run(initial_file: str | None = None) -> None:
-    # tkinter(Tcl)는 "인터프리터를 만든 스레드"와 "mainloop를 돌리는 스레드"가
-    # 반드시 같아야 한다. 앞선 버전은 app을 메인 스레드에서 만들고 mainloop만
-    # 별도 스레드로 돌려서 "different apartment" 오류가 났다. 이번엔 생성과
-    # mainloop를 같은 백그라운드 스레드에 묶고, pywebview(웹 창)는 원래대로
-    # 메인 스레드에서 돌린다.
-    app_holder: dict[str, EAccApplication] = {}
-    app_ready = threading.Event()
-
-    def _tk_thread() -> None:
-        app = EAccApplication()
-        if initial_file:
-            app.after(150, lambda: app._import_file(initial_file))
-        # 기존 tkinter 창은 화면에 띄우지 않는다 — 자동화 로직과 상태 관리는
-        # 그대로 뒤에서 돌아가고, 실제로 보이는 화면은 웹(pywebview) 창 하나뿐이다.
-        app.withdraw()
-        app_holder["app"] = app
-        app_ready.set()
-        app.mainloop()
-
-    threading.Thread(target=_tk_thread, daemon=True).start()
-    app_ready.wait()
-    app = app_holder["app"]
-
-    web_index = Path(__file__).resolve().parent / "web" / "index.html"
-    api = EAccWebApi(app)
-    window = webview.create_window(
-        f"{APP_TITLE} - 웹 UI",
-        url=web_index.as_uri(),
-        js_api=api,
-        width=1480,
-        height=900,
-        min_size=(1120, 660),
-    )
-
-    def _on_web_closed() -> None:
-        app.after(0, app._on_close)
-
-    def _on_web_loaded() -> None:
-        # 페이지(HTML/JS)가 실제로 다 로드된 뒤에 첫 데이터를 밀어넣는다.
-        # 로드되기 전에 evaluate_js를 부르면 조용히 실패할 수 있어서,
-        # "탭에 데이터가 안 보인다"의 흔한 원인 중 하나였다.
-        app.after(0, app._start_web_sync, window)
-
-    window.events.closed += _on_web_closed
-    window.events.loaded += _on_web_loaded
-
-    # 우클릭 → 검사(Inspect)로 개발자 도구가 필요할 때만 켤 수 있게
-    # debug=False로 되돌린다 (True로 두면 DevTools 창이 매번 따로 떴다).
-    webview.start(debug=False)
-
+    app = EAccApplication()
+    if initial_file:
+        app.after(150, lambda: app._import_file(initial_file))
+    app.mainloop()
