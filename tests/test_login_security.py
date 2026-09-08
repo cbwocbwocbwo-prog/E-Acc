@@ -41,24 +41,16 @@ class LoginCredentialSecurityTests(unittest.TestCase):
         self.assertIn("closeAlarmPopup", page.script)
         self.assertIn("#popbtnArea", page.script)
 
-    def test_approval_confirmation_is_preaccepted_in_all_popup_frames(self) -> None:
-        class FakeFrame:
-            def __init__(self) -> None:
-                self.scripts: list[str] = []
-
-            def evaluate(self, script: str) -> None:
-                self.scripts.append(script)
-
-        class FakePopup:
-            def __init__(self) -> None:
-                self.frames = (FakeFrame(), FakeFrame())
-
-        popup = FakePopup()
-        EAccountingBrowserService._accept_eacc_approval_confirmations(popup)
-
-        self.assertTrue(all(frame.scripts for frame in popup.frames))
+    def test_other_user_processing_match_requires_the_actual_lock_message(self) -> None:
         self.assertTrue(
-            all("text.includes('결재요청')" in frame.scripts[0] for frame in popup.frames)
+            EAccountingBrowserService._is_other_user_processing(
+                "이미 다른 사용자가 처리중입니다."
+            )
+        )
+        self.assertFalse(
+            EAccountingBrowserService._is_other_user_processing(
+                "다른 사용자가 처리 중인 건이 아니므로 결재요청 가능합니다."
+            )
         )
 
     def test_approval_window_dialog_is_accepted_and_recorded(self) -> None:

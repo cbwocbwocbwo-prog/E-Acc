@@ -13,6 +13,7 @@ from .models import (
     ImportHistoryItem,
     ImportSummary,
     ProcessingEvent,
+    MailLogItem,
     UnsubmittedTransaction,
 )
 from .parser import parse_unsubmitted_xls
@@ -60,12 +61,30 @@ CREATE TABLE IF NOT EXISTS processing_events (
     evidence_date TEXT NOT NULL,
     amount TEXT NOT NULL,
     merchant TEXT NOT NULL,
+    account_name TEXT NOT NULL DEFAULT '',
     status TEXT NOT NULL,
     reason TEXT NOT NULL DEFAULT ''
 );
 
 CREATE INDEX IF NOT EXISTS idx_processing_events_transaction
 ON processing_events(transaction_id, id DESC);
+
+CREATE TABLE IF NOT EXISTS mail_delivery_logs (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    sent_at TEXT NOT NULL,
+    recipient_name TEXT NOT NULL,
+    recipient_email TEXT NOT NULL DEFAULT '',
+    department TEXT NOT NULL DEFAULT '',
+    transaction_count INTEGER NOT NULL DEFAULT 0,
+    subject TEXT NOT NULL,
+    status TEXT NOT NULL,
+    reason TEXT NOT NULL DEFAULT '',
+    transaction_ids_json TEXT NOT NULL DEFAULT '[]'
+    ,outlook_message_id TEXT NOT NULL DEFAULT ''
+);
+
+CREATE INDEX IF NOT EXISTS idx_mail_delivery_logs_status
+ON mail_delivery_logs(status, id DESC);
 """
 
 
@@ -93,6 +112,60 @@ class ImportRepository:
     def _initialize(self) -> None:
         with self._connection() as connection:
             connection.executescript(SCHEMA)
+            # Existing user databases were created before account_name was
+            # retained with processing events.  Keep their audit data and add
+            # the display-only column in place.
+            columns = {
+                str(row["name"])
+                for row in connection.execute("PRAGMA table_info(processing_events)").fetchall()
+            }
+            if "account_name" not in columns:
+                connection.execute(
+                    "ALTER TABLE processing_events ADD COLUMN account_name TEXT NOT NULL DEFAULT ''"
+                )
+            mail_columns = {
+                str(row["name"])
+                for row in connection.execute("PRAGMA table_info(mail_delivery_logs)").fetchall()
+            }
+            if "outlook_message_id" not in mail_columns:
+                connection.execute(
+                    "ALTER TABLE mail_delivery_logs ADD COLUMN outlook_message_id TEXT NOT NULL DEFAULT ''"
+                )
+            # Earlier builds called Outlook.Send() and immediately wrote
+            # '발송 완료'.  That only proves the item entered Outlook, not that
+            # it reached Sent Items, so preserve the audit row but correct the
+            # misleading final state.
+            connection.execute(
+                """
+                UPDATE mail_delivery_logs
+                SET status = '발송 확인 불가',
+                    reason = '이전 버전은 Outlook 보낸 편지함 확인 없이 발송 완료로 기록했습니다.'
+                WHERE status = '발송 완료' AND reason = 'Outlook 발송 요청 완료'
+                """
+            )
+            # Processing events written by earlier versions did not retain the
+            # account name.  It is already present in the transaction snapshot,
+            # so restore only this display field without changing any result or
+            # audit timestamp.
+            rows = connection.execute(
+                """
+                SELECT event.id, txn.source_data_json
+                FROM processing_events AS event
+                INNER JOIN transactions AS txn
+                    ON txn.transaction_id = event.transaction_id
+                WHERE event.account_name = ''
+                """
+            ).fetchall()
+            for row in rows:
+                try:
+                    account_name = str(json.loads(row["source_data_json"]).get("account_name", ""))
+                except (TypeError, ValueError, json.JSONDecodeError):
+                    account_name = ""
+                if account_name:
+                    connection.execute(
+                        "UPDATE processing_events SET account_name = ? WHERE id = ?",
+                        (account_name, row["id"]),
+                    )
 
     def import_file(self, file_path: str | Path) -> ImportSummary:
         path = Path(file_path).resolve()
@@ -219,6 +292,7 @@ class ImportRepository:
         transaction: UnsubmittedTransaction,
         status: str,
         reason: str = "",
+        outlook_message_id: str = "",
     ) -> ProcessingEvent:
         event_at = datetime.now().astimezone().isoformat(timespec="seconds")
         with self._connection() as connection:
@@ -226,8 +300,8 @@ class ImportRepository:
                 """
                 INSERT INTO processing_events(
                     event_at, transaction_id, approval_number, evidence_date,
-                    amount, merchant, status, reason
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                    amount, merchant, account_name, status, reason
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     event_at,
@@ -236,6 +310,7 @@ class ImportRepository:
                     transaction.evidence_date,
                     f"{transaction.amount:,.0f}",
                     transaction.merchant,
+                    transaction.account_name,
                     status,
                     reason,
                 ),
@@ -251,6 +326,7 @@ class ImportRepository:
             merchant=transaction.merchant,
             status=status,
             reason=reason,
+            account_name=transaction.account_name,
         )
 
     def recent_processing_events(self, limit: int = 500) -> tuple[ProcessingEvent, ...]:
@@ -258,7 +334,7 @@ class ImportRepository:
             rows = connection.execute(
                 """
                 SELECT id, event_at, transaction_id, approval_number, evidence_date,
-                       amount, merchant, status, reason
+                       amount, merchant, account_name, status, reason
                 FROM processing_events
                 ORDER BY id DESC
                 LIMIT ?
@@ -276,6 +352,7 @@ class ImportRepository:
                 merchant=row["merchant"],
                 status=row["status"],
                 reason=row["reason"],
+                account_name=row["account_name"],
             )
             for row in rows
         )
@@ -311,3 +388,83 @@ class ImportRepository:
                 parameters,
             ).fetchall()
         return {str(row["transaction_id"]): str(row["status"]) for row in rows}
+
+    def record_mail_log(
+        self,
+        *,
+        recipient_name: str,
+        recipient_email: str,
+        department: str,
+        transaction_ids: tuple[str, ...],
+        subject: str,
+        status: str,
+        reason: str = "",
+        outlook_message_id: str = "",
+    ) -> MailLogItem:
+        sent_at = datetime.now().astimezone().isoformat(timespec="seconds")
+        logged_email = _mask_email(recipient_email)
+        with self._connection() as connection:
+            cursor = connection.execute(
+                """
+                INSERT INTO mail_delivery_logs(
+                    sent_at, recipient_name, recipient_email, department,
+                    transaction_count, subject, status, reason, transaction_ids_json, outlook_message_id
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    sent_at, recipient_name, logged_email, department,
+                    len(transaction_ids), subject, status, reason,
+                    json.dumps(transaction_ids, ensure_ascii=False),
+                    outlook_message_id,
+                ),
+            )
+            log_id = int(cursor.lastrowid)
+        return MailLogItem(
+            log_id=log_id, sent_at=sent_at, recipient_name=recipient_name,
+            recipient_email=logged_email, department=department,
+            transaction_count=len(transaction_ids), subject=subject,
+            status=status, reason=reason, transaction_ids=transaction_ids,
+            outlook_message_id=outlook_message_id,
+        )
+
+    def recent_mail_logs(self, limit: int = 500) -> tuple[MailLogItem, ...]:
+        with self._connection() as connection:
+            rows = connection.execute(
+                """
+                SELECT id, sent_at, recipient_name, recipient_email, department,
+                       transaction_count, subject, status, reason, transaction_ids_json, outlook_message_id
+                FROM mail_delivery_logs ORDER BY id DESC LIMIT ?
+                """,
+                (limit,),
+            ).fetchall()
+        result: list[MailLogItem] = []
+        for row in rows:
+            try:
+                transaction_ids = tuple(str(value) for value in json.loads(row["transaction_ids_json"]))
+            except (TypeError, ValueError, json.JSONDecodeError):
+                transaction_ids = ()
+            result.append(MailLogItem(
+                log_id=row["id"], sent_at=row["sent_at"],
+                recipient_name=row["recipient_name"], recipient_email=row["recipient_email"],
+                department=row["department"], transaction_count=row["transaction_count"],
+                subject=row["subject"], status=row["status"], reason=row["reason"],
+                transaction_ids=transaction_ids,
+                outlook_message_id=row["outlook_message_id"],
+            ))
+        return tuple(result)
+
+    def update_mail_status(self, log_id: int, status: str, reason: str) -> None:
+        with self._connection() as connection:
+            connection.execute(
+                "UPDATE mail_delivery_logs SET status = ?, reason = ? WHERE id = ?",
+                (status, reason, log_id),
+            )
+
+
+def _mask_email(value: str) -> str:
+    """Keep delivery logs useful without persisting the recipient address."""
+    local, separator, domain = value.strip().partition("@")
+    if not separator:
+        return ""
+    visible = local[:1] if local else ""
+    return f"{visible}{'*' * max(2, len(local) - 1)}@{domain}"

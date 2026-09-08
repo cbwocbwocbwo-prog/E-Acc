@@ -149,9 +149,15 @@ def validate_account_rules(
                 required_employee_count=required,
                 matched_employee_names=matched_names,
             )
+        names = ", ".join(matched_names)
         return _result(
             transaction,
             "정상",
+            (
+                "특근자식비 사용인원 확인"
+                f" (사용금액 {transaction.amount:,.0f}원 / 필요 {required}명 / "
+                f"인정 {len(matched_names)}명: {names})",
+            ),
             required_employee_count=required,
             matched_employee_names=matched_names,
         )
@@ -162,11 +168,25 @@ def validate_account_rules(
         if description:
             reasons.append("불필요한 적요 작성")
         if receipt_text is None:
-            return _result(transaction, "예외" if reasons else "검증대기", tuple(reasons))
+            pending_reason = "영수증 OCR 검증 대기"
+            return _result(
+                transaction,
+                "예외" if reasons else "검증대기",
+                tuple((*reasons, pending_reason)),
+            )
         alcohol_matches = _matching_keywords(receipt_text, ALCOHOL_KEYWORDS)
         if alcohol_matches:
             reasons.append("영수증에 주류포함" + f" ({', '.join(alcohol_matches)})")
-        return _result(transaction, "예외" if reasons else "정상", tuple(reasons))
+        if reasons:
+            return _result(transaction, "예외", tuple(reasons))
+        return _result(
+            transaction,
+            "정상",
+            (
+                "현장대리인 활동지원 식음료대 확인"
+                f" (사용금액 {transaction.amount:,.0f}원 / 적요 없음 / 주류 키워드 없음)",
+            ),
+        )
 
     expected_category = next(
         (name for name in VEHICLE_RECEIPT_CATEGORIES if _normalize(name) == account_name),
@@ -174,7 +194,7 @@ def validate_account_rules(
     )
     if expected_category is not None:
         if receipt_text is None:
-            return _result(transaction, "검증대기")
+            return _result(transaction, "검증대기", ("영수증 OCR 검증 대기",))
         detected_categories = _detect_vehicle_categories(receipt_text)
         expected_name = expected_category
         if detected_categories and detected_categories != (expected_name,):
@@ -185,13 +205,21 @@ def validate_account_rules(
                 detected_receipt_categories=detected_categories,
             )
         # No recognizable comparison word is intentionally considered normal.
+        if detected_categories:
+            audit_reason = (
+                f"{expected_name} 영수증 키워드 확인"
+                f" ({', '.join(detected_categories)})"
+            )
+        else:
+            audit_reason = f"{expected_name}: 비교 키워드 미검출(정상 간주)"
         return _result(
             transaction,
             "정상",
+            (audit_reason,),
             detected_receipt_categories=detected_categories,
         )
 
-    return _result(transaction, "정상")
+    return _result(transaction, "정상", ("별도 계정별 검증 규칙 대상 아님",))
 
 
 def _result(

@@ -17,8 +17,10 @@ from typing import Callable
 from urllib.parse import parse_qsl, urlencode, urljoin, urlparse, urlsplit, urlunsplit
 from urllib.request import urlopen
 
+from .mail_notifications import UnprocessedCardUse
 from .models import ReceiptImageResult, UnsubmittedTransaction
 from .parser import GridRowFormatError, transaction_from_grid_row
+from .unprocessed_card import UnprocessedCardFormatError, unprocessed_use_from_grid_row
 
 
 I_NET_URL = "https://i-net.skons.co.kr/"
@@ -49,6 +51,10 @@ class BrowserLoginRequired(BrowserAutomationError):
 
 class NoUnsubmittedTransactions(BrowserAutomationError):
     """Raised when the e-Accounting search completed normally with zero rows."""
+
+
+class NoUnprocessedCardUses(BrowserAutomationError):
+    """Raised when the 미처리내역 search completed normally with zero rows."""
 
 
 class NoEligibleTransactions(NoUnsubmittedTransactions):
@@ -125,6 +131,13 @@ class _CurrentTargetCommand:
 
 
 @dataclass(frozen=True, slots=True)
+class _UnprocessedCardCommand:
+    credentials: LoginCredentials | None
+    on_success: Callable[[tuple[UnprocessedCardUse, ...]], None]
+    on_error: Callable[[Exception], None]
+
+
+@dataclass(frozen=True, slots=True)
 class _ReceiptCommand:
     transaction: UnsubmittedTransaction
     credentials: LoginCredentials | None
@@ -197,6 +210,7 @@ class EAccountingBrowserService:
         self._commands: queue.Queue[
             _CollectCommand
             | _CurrentTargetCommand
+            | _UnprocessedCardCommand
             | _ReceiptCommand
             | _ActualMerchantRegistrationCommand
             | _OpenApprovalLineCommand
@@ -210,7 +224,9 @@ class EAccountingBrowserService:
         # "다른 사용자가 처리중" 알림은 결재요청 버튼을 누르기 전, 팝업 초기
         # 로딩 중에 발생하므로 submit 단계에서만 listener를 붙이면 늦는다.
         self._prepared_approval_dialog_messages: list[str] = []
-        self._prepared_approval_dialog_popup_id: int | None = None
+        # id(popup)는 객체 수명 뒤에 재사용될 수 있으므로, 실제 Popup 객체로
+        # 같은 결재선 창인지 판별한다.
+        self._prepared_approval_popup_object = None
         self._thread = threading.Thread(
             target=self._worker,
             name="eaccounting-browser-worker",
@@ -248,6 +264,15 @@ class EAccountingBrowserService:
                 on_error=on_error,
             )
         )
+
+    def collect_unprocessed_card_uses(
+        self,
+        credentials: LoginCredentials | None,
+        on_success: Callable[[tuple[UnprocessedCardUse, ...]], None],
+        on_error: Callable[[Exception], None],
+    ) -> None:
+        """Read all current 미처리내역 rows through the active e-Acc session."""
+        self._commands.put(_UnprocessedCardCommand(credentials, on_success, on_error))
 
     def download_receipt(
         self,
@@ -450,6 +475,10 @@ class EAccountingBrowserService:
                             context,
                             command.credentials,
                             command.excluded_transaction_ids,
+                        )
+                    elif isinstance(command, _UnprocessedCardCommand):
+                        result = self._collect_unprocessed_card_uses(
+                            context, command.credentials
                         )
                     elif isinstance(command, _ReceiptCommand):
                         result = self._download_receipt(
@@ -1056,6 +1085,39 @@ class EAccountingBrowserService:
             "미상신내역은 남아 있으나, 이번 실행에서 예외처리한 행 외에는 처리 가능 행이 없습니다."
         )
 
+    def _collect_unprocessed_card_uses(
+        self, context, credentials: LoginCredentials | None
+    ) -> tuple[UnprocessedCardUse, ...]:
+        page = self._ensure_eaccounting_page(context, credentials)
+        page.bring_to_front()
+        self._open_card_processing_top_menu(page)
+        self._open_unprocessed_card_menu(page)
+        main_frame = self._wait_for_frame(page, "mainFrame")
+        self._query_unsubmitted(main_frame)
+        grid = main_frame.evaluate(
+            """
+            () => {
+                const rowIds = GridObj.getAllRowIds().split(',').filter(Boolean);
+                const count = GridObj.getColumnsNum();
+                return {
+                    headers: Array.from({length: count}, (_, i) => String(GridObj.getColLabel(i) ?? GridObj.getColumnId(i) ?? '').trim()),
+                    rows: rowIds.map(rowId => Array.from({length: count}, (_, i) => String(GridObj.cells(rowId, i).getValue() ?? '').trim())),
+                };
+            }
+            """
+        )
+        if not grid or not grid["rows"]:
+            raise NoUnprocessedCardUses("미처리내역 검색 결과가 없습니다.")
+        uses: list[UnprocessedCardUse] = []
+        for index, values in enumerate(grid["rows"], start=1):
+            try:
+                uses.append(unprocessed_use_from_grid_row(index, grid["headers"], values))
+            except UnprocessedCardFormatError as exc:
+                raise BrowserAutomationError(
+                    f"미처리내역 {index}번째 행을 해석하지 못했습니다. {exc}"
+                ) from exc
+        return tuple(uses)
+
     def _download_receipt(
         self,
         context,
@@ -1269,7 +1331,7 @@ class EAccountingBrowserService:
         """
         self._prepared_approval_transaction_id = None
         self._prepared_approval_dialog_messages = []
-        self._prepared_approval_dialog_popup_id = None
+        self._prepared_approval_popup_object = None
         # Edge를 CDP로 연결한 경우 Playwright의 ``dialog`` 이벤트가 새 팝업의
         # 첫 inline script가 띄운 alert보다 늦게 도착할 수 있다. 팝업을 열기
         # *전* 해당 잠금 알림만 브라우저 안에서 기록하고 차단한다.
@@ -1325,15 +1387,13 @@ class EAccountingBrowserService:
             attach_dialog_handler(popup)
             popup.wait_for_url("**/approval/approval_set_list_popup.jsp?**", timeout=15_000)
             popup.bring_to_front()
-            response = self._approval_dialog_response(popup, dialog_messages)
-            if self._is_other_user_processing(response):
-                self._close_approval_popup_and_clear_selection(context, popup)
-                raise ApprovalInProgressError(
-                    "이미 다른 사용자가 처리중입니다. 결재선 지정 창을 닫고 이 행을 예외처리했습니다."
-                )
+            # URL만 준비된 시점에는 결재선 화면의 onclick 연결이 아직 끝나지
+            # 않을 수 있다. 이전의 프로그램 확인창이 제공하던 대기를 명시적인
+            # 팝업 준비 확인으로 대체한다.
+            self._wait_for_approval_popup_ready(popup, dialog_messages)
             self._prepared_approval_transaction_id = transaction.transaction_id
             self._prepared_approval_dialog_messages = dialog_messages
-            self._prepared_approval_dialog_popup_id = id(popup)
+            self._prepared_approval_popup_object = popup
             opened = True
             return (
                 "결재선 지정 창을 열었습니다. e-Acc 결재요청을 전송합니다."
@@ -1351,7 +1411,7 @@ class EAccountingBrowserService:
             if not opened:
                 self._prepared_approval_transaction_id = None
                 self._prepared_approval_dialog_messages = []
-                self._prepared_approval_dialog_popup_id = None
+                self._prepared_approval_popup_object = None
                 try:
                     main_frame.evaluate(
                         """
@@ -1372,15 +1432,8 @@ class EAccountingBrowserService:
                 "현재 거래에 대해 프로그램이 연 결재선 지정 창이 아닙니다. "
                 "다시 결재선 지정부터 진행해 주세요."
             )
-        popup = next(
-            (
-                candidate
-                for candidate in reversed(tuple(self._snapshot_pages(context)))
-                if not candidate.is_closed() and "approval_set_list_popup.jsp" in candidate.url
-            ),
-            None,
-        )
-        if popup is None:
+        popup = self._prepared_approval_popup_object
+        if popup is None or popup.is_closed():
             raise ApprovalRequestError(
                 "결재선 지정 창이 닫혔습니다. 결재요청을 전송하지 않았습니다."
             )
@@ -1393,36 +1446,14 @@ class EAccountingBrowserService:
     ) -> str:
         """Click the approval-request action after all program validations pass."""
         popup = self._prepared_approval_popup(context, transaction)
-        if self._prepared_approval_dialog_popup_id == id(popup):
-            dialog_messages = self._prepared_approval_dialog_messages
-        else:
-            dialog_messages = []
-            self._install_approval_dialog_handler(popup, dialog_messages)
-            self._prepared_approval_dialog_messages = dialog_messages
-            self._prepared_approval_dialog_popup_id = id(popup)
+        dialog_messages = self._prepared_approval_dialog_messages
 
         try:
-            # Some e-Acc tenants show a synchronous browser confirm dialog
-            # ("결재요청 하시겠습니까?") only intermittently.  The user has
-            # has already initiated the program's 결재요청 action at this point,
-            # so bypass this *specific* second confirmation before clicking.
-            # Keep the dialog listener as a fallback for page revisions or
-            # dialogs raised from a nested frame.
-            self._accept_eacc_approval_confirmations(popup)
-            request_button = popup.get_by_text("결재요청", exact=True)
-            if request_button.count() != 1:
-                request_button = popup.locator(
-                    "input[type='button'][value='결재요청'], "
-                    "input[type='submit'][value='결재요청'], "
-                    "button:has-text('결재요청'), a:has-text('결재요청')"
-                )
-            if request_button.count() != 1:
-                raise ApprovalRequestError(
-                    "결재선 지정 창에서 '결재요청' 버튼을 하나로 찾지 못했습니다. "
-                    "결재요청은 전송하지 않았습니다."
-                )
+            request_button = self._wait_for_approval_popup_ready(popup, dialog_messages)
             try:
-                request_button.click(force=True, timeout=10_000)
+                # 강제 클릭은 버튼의 실제 초기화 전에도 실행돼 e-Acc에 전송되지
+                # 않는 무효 클릭을 만들 수 있다. 준비 확인 뒤 일반 클릭을 쓴다.
+                request_button.click(timeout=10_000)
             except Exception as exc:
                 # e-Acc는 결재요청 클릭이 성공하면 결재선 지정 창을 즉시 닫는다.
                 # 그 정상 닫힘이 Playwright 클릭 완료보다 먼저 발생하면
@@ -1453,6 +1484,11 @@ class EAccountingBrowserService:
             if response and any(word in response for word in ("실패", "오류", "잘못", "불가")):
                 raise ApprovalRequestError(f"e-Acc 결재요청이 완료되지 않았습니다: {response}")
             return response or "e-Acc의 결재요청 클릭을 전송했습니다. 최신 목록 재조회로 처리 결과를 확인해 주세요."
+        except ApprovalInProgressError:
+            # 잠금 알림이 팝업 초기화 완료 직후에 도착한 경우에도 열린 결재선
+            # 창을 남기지 않는다. UI는 이 예외를 예외처리 이력으로 기록한다.
+            self._close_approval_popup_and_clear_selection(context, popup)
+            raise
         except ApprovalRequestError:
             raise
         except Exception as exc:
@@ -1462,7 +1498,63 @@ class EAccountingBrowserService:
             # prevents a later button press from submitting the same popup again.
             self._prepared_approval_transaction_id = None
             self._prepared_approval_dialog_messages = []
-            self._prepared_approval_dialog_popup_id = None
+            self._prepared_approval_popup_object = None
+
+    def _wait_for_approval_popup_ready(self, popup, dialog_messages: list[str]):
+        """Return the live e-Acc request button only after popup initialization."""
+        try:
+            popup.wait_for_load_state("domcontentloaded", timeout=15_000)
+            popup.wait_for_function("() => document.readyState === 'complete'", timeout=15_000)
+        except Exception as exc:
+            self._raise_if_other_user_processing(
+                self._approval_dialog_response(popup, dialog_messages)
+            )
+            raise ApprovalRequestError(
+                f"결재선 지정 창의 초기화 완료를 확인하지 못했습니다: {exc}"
+            ) from exc
+
+        self._raise_if_other_user_processing(
+            self._approval_dialog_response(popup, dialog_messages)
+        )
+        request_button = popup.get_by_text("결재요청", exact=True)
+        if request_button.count() != 1:
+            request_button = popup.locator(
+                "input[type='button'][value='결재요청'], "
+                "input[type='submit'][value='결재요청'], "
+                "button:has-text('결재요청'), a:has-text('결재요청')"
+            )
+        if request_button.count() != 1:
+            raise ApprovalRequestError(
+                "결재선 지정 창에서 '결재요청' 버튼을 하나로 찾지 못했습니다. "
+                "결재요청은 전송하지 않았습니다."
+            )
+        try:
+            request_button.wait_for(state="visible", timeout=15_000)
+            request_button.scroll_into_view_if_needed(timeout=10_000)
+            is_enabled = request_button.evaluate("element => !element.disabled")
+            if not is_enabled:
+                raise RuntimeError("결재요청 버튼이 비활성 상태입니다.")
+            # 화면 표시·이벤트 연결 사이의 짧은 간격을 안정화한다. 이는 없앤
+            # 프로그램 확인창이 우연히 제공하던 대기를 명시한 것이다.
+            popup.wait_for_timeout(500)
+        except Exception as exc:
+            self._raise_if_other_user_processing(
+                self._approval_dialog_response(popup, dialog_messages)
+            )
+            raise ApprovalRequestError(
+                f"결재요청 버튼의 준비 상태를 확인하지 못했습니다: {exc}"
+            ) from exc
+        self._raise_if_other_user_processing(
+            self._approval_dialog_response(popup, dialog_messages)
+        )
+        return request_button
+
+    @staticmethod
+    def _raise_if_other_user_processing(response: str) -> None:
+        if EAccountingBrowserService._is_other_user_processing(response):
+            raise ApprovalInProgressError(
+                "이미 다른 사용자가 처리중입니다. 결재선 지정 창을 닫고 이 행을 예외처리했습니다."
+            )
 
     @staticmethod
     def _install_approval_dialog_handler(popup, dialog_messages: list[str]) -> None:
@@ -1497,7 +1589,7 @@ class EAccountingBrowserService:
                 window.alert = message => {
                     const text = String(message ?? '');
                     const normalized = text.replace(/\s+/g, '');
-                    if (normalized.includes('다른사용자') && normalized.includes('처리중')) {
+                    if (normalized.includes('이미다른사용자가처리중')) {
                         window.__eaccOtherUserLockAlertMessage = text;
                         return;
                     }
@@ -1535,38 +1627,9 @@ class EAccountingBrowserService:
         return " / ".join(messages)
 
     @staticmethod
-    def _accept_eacc_approval_confirmations(popup) -> None:
-        """Make only the e-Acc approval confirm return ``true`` in every frame.
-
-        It is installed only after the user clicked the application's
-        ``선택 행 결재요청`` action. Other confirmations continue to use their
-        native behavior; the page-level dialog handler remains a fallback for
-        alerts and vendor-specific popup implementations.
-        """
-        script = r"""
-            () => {
-                if (window.__eaccApprovalConfirmPatched) return;
-                window.__eaccApprovalConfirmPatched = true;
-                const originalConfirm = window.confirm.bind(window);
-                window.confirm = message => {
-                    const text = String(message ?? '').replace(/\s+/g, '');
-                    if (text.includes('결재요청')) return true;
-                    return originalConfirm(message);
-                };
-            }
-        """
-        for frame in popup.frames:
-            try:
-                frame.evaluate(script)
-            except Exception:
-                # Frame navigation/teardown must not prevent the normal
-                # Playwright dialog fallback from accepting the confirmation.
-                continue
-
-    @staticmethod
     def _is_other_user_processing(message: str) -> bool:
         normalized = "".join(message.split())
-        return "다른사용자" in normalized and "처리중" in normalized
+        return "이미다른사용자가처리중" in normalized
 
     def _close_approval_popup_and_clear_selection(self, context, popup) -> None:
         """Clean up the open popup and its grid selection after a lock alert."""
@@ -1838,6 +1901,28 @@ class EAccountingBrowserService:
                 return
             page.wait_for_timeout(50)
         raise BrowserAutomationError("'미상신내역' 화면 이동이 완료되지 않았습니다.")
+
+    def _open_unprocessed_card_menu(self, page) -> None:
+        """Open the visible 미처리내역 menu without guessing its page type."""
+        left_frame = self._wait_for_frame(page, "leftFrame")
+        previous_url = self._wait_for_frame(page, "mainFrame").url
+        menu = left_frame.get_by_text("미처리내역", exact=True).first
+        try:
+            menu.wait_for(state="attached", timeout=15_000)
+            menu.evaluate("element => eval(element.getAttribute('onclick'))")
+        except Exception as exc:
+            raise BrowserAutomationError("왼쪽 메뉴에서 '미처리내역'을 찾거나 열지 못했습니다.") from exc
+        deadline = time.monotonic() + 15
+        while time.monotonic() < deadline:
+            main_frame = page.frame(name="mainFrame")
+            if main_frame is not None and main_frame.url != previous_url:
+                try:
+                    main_frame.locator("select#CARD_NO").wait_for(state="visible", timeout=3_000)
+                    return
+                except Exception:
+                    pass
+            page.wait_for_timeout(50)
+        raise BrowserAutomationError("'미처리내역' 화면 이동이 완료되지 않았습니다.")
 
     @staticmethod
     def _wait_for_frame(page, name: str, timeout_ms: int = 15_000):

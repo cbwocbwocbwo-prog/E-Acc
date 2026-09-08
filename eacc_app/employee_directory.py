@@ -14,6 +14,8 @@ class EmployeeDirectoryError(RuntimeError):
 
 _HEADER = b"EACCMAIL1\x00"
 _NAME_FIELDS = {"성명", "이름", "name", "employee_name", "employeename"}
+_EMAIL_FIELDS = {"이메일", "이메일주소", "email", "email_address", "mail"}
+_DEPARTMENT_FIELDS = {"부서", "부서명", "department", "team", "조직"}
 _DPAPI_ENTROPY = b"E-AccAutoProcess|MailInfo|v1"
 
 
@@ -27,6 +29,33 @@ def load_employee_names(path: Path | None = None) -> tuple[str, ...]:
     Email addresses are intentionally not returned or logged.  The existing
     ``EACCMAIL1`` format stores a Windows DPAPI-protected UTF-8 JSON payload.
     """
+    decoded = _load_directory_payload(path)
+    names = _extract_names(decoded)
+    if not names:
+        raise EmployeeDirectoryError("직원 명단에서 성명 정보를 찾지 못했습니다.")
+    return tuple(sorted(names))
+
+
+def load_mail_recipients(path: Path | None = None) -> tuple[dict[str, str], ...]:
+    """Return recipient records only inside the running process.
+
+    Callers must never persist plaintext addresses to the ordinary activity log.
+    """
+    decoded = _load_directory_payload(path)
+    records: list[dict[str, str]] = []
+    for item in _walk_mappings(decoded):
+        normalized = {str(key).replace(" ", "").casefold(): str(value).strip() for key, value in item.items()}
+        name = next((normalized[key] for key in _NAME_FIELDS if normalized.get(key)), "")
+        email = next((normalized[key] for key in _EMAIL_FIELDS if normalized.get(key)), "")
+        department = next((normalized[key] for key in _DEPARTMENT_FIELDS if normalized.get(key)), "")
+        if name and email:
+            records.append({"name": name, "email": email, "department": department})
+    if not records:
+        raise EmployeeDirectoryError("직원 명단에서 이메일 정보를 찾지 못했습니다.")
+    return tuple(records)
+
+
+def _load_directory_payload(path: Path | None) -> Any:
     source = path or default_employee_directory_path()
     try:
         encrypted = source.read_bytes()
@@ -43,10 +72,7 @@ def load_employee_names(path: Path | None = None) -> tuple[str, ...]:
     except Exception as exc:
         raise EmployeeDirectoryError("직원 명단 암호화 파일을 해독할 수 없습니다.") from exc
 
-    names = _extract_names(decoded)
-    if not names:
-        raise EmployeeDirectoryError("직원 명단에서 성명 정보를 찾지 못했습니다.")
-    return tuple(sorted(names))
+    return decoded
 
 
 def _extract_names(value: Any) -> set[str]:
@@ -67,6 +93,16 @@ def _extract_names(value: Any) -> set[str]:
 
     visit(value)
     return names
+
+
+def _walk_mappings(value: Any):
+    if isinstance(value, Mapping):
+        yield value
+        for child in value.values():
+            yield from _walk_mappings(child)
+    elif isinstance(value, list):
+        for child in value:
+            yield from _walk_mappings(child)
 
 
 def _unprotect_dpapi(ciphertext: bytes) -> bytes:

@@ -188,3 +188,19 @@ class ProcessingEvent:
     merchant: str
     status: str
     reason: str
+    account_name: str = ""
+
+
+@dataclass(frozen=True, slots=True)
+class MailLogItem:
+    log_id: int
+    sent_at: str
+    recipient_name: str
+    recipient_email: str
+    department: str
+    transaction_count: int
+    subject: str
+    status: str
+    reason: str
+    transaction_ids: tuple[str, ...]
+    outlook_message_id: str = ""

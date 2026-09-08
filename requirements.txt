@@ -1,5 +1,6 @@
 playwright==1.60.0
 Pillow==12.1.1
+pywin32>=311,<313
 winrt-runtime==3.2.1
 winrt-Windows.Foundation==3.2.1
 winrt-Windows.Foundation.Collections==3.2.1
