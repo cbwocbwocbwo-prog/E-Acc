@@ -89,6 +89,13 @@ def send_via_outlook(recipient: MailRecipient, html_body: str) -> tuple[str, str
 
     A successful return means Outlook accepted ``Send``.  It does not claim
     that the recipient has opened or read the message.
+
+    Sender-account resolution:
+      1) If %LOCALAPPDATA%\\EAccAutomation\\mail_sender.json exists AND
+         specifies ``outlook_sender_address``, the message is bound to that
+         specific Outlook account (this PC override).
+      2) Otherwise the profile's default Outlook account is used
+         (the correct behavior for deployment).
     """
     if not recipient.email or "@" not in recipient.email:
         raise ValueError("유효한 수신자 이메일 주소가 없습니다.")
@@ -103,21 +110,19 @@ def send_via_outlook(recipient: MailRecipient, html_body: str) -> tuple[str, str
     if sender_address:
         send_account = _find_outlook_account(outlook, sender_address)
         if send_account is None:
+            # List every SMTP address Outlook currently knows about so the
+            # user can see why the requested override could not be honored.
+            available = _list_outlook_smtp_addresses(outlook)
             raise RuntimeError(
                 f"로컬 발신 계정({sender_address})을 Outlook에서 찾을 수 없습니다. "
-                "이 PC의 Outlook 또는 로컬 설정을 확인해 주세요."
+                f"현재 Outlook에 구성된 계정: {available or '(없음)'}. "
+                "이 PC의 Outlook 계정 설정 또는 mail_sender.json을 확인해 주세요."
             )
-    if send_account is None:
-        # No per-PC override: Outlook's normal default-account behavior.
-        mail = outlook.CreateItem(0)
-    else:
-        # Creating the item in the selected account's Drafts store is the
-        # reliable Outlook/Exchange way to bind the message to that account.
-        # SendUsingAccount alone may be ignored for items first created in
-        # the profile's default store.
-        mail = send_account.DeliveryStore.GetDefaultFolder(OL_FOLDER_DRAFTS).Items.Add(
-            "IPM.Note"
-        )
+    # Always create the mail item from the Application object.  Creating it
+    # inside a specific account's Drafts store is unreliable: on Exchange/
+    # shared-mailbox profiles Outlook silently falls back to the profile's
+    # default store, which then wins over SendUsingAccount at send time.
+    mail = outlook.CreateItem(0)  # 0 = olMailItem
     mail.To = recipient.email
     mail.Subject = MAIL_SUBJECT
     # Outlook may preserve UserProperties in the Outbox but not expose them
@@ -129,18 +134,58 @@ def send_via_outlook(recipient: MailRecipient, html_body: str) -> tuple[str, str
     # message safely.  Store a private Outlook user property for subsequent
     # Outbox/Sent Items verification.
     mail.UserProperties.Add("EAccAutomationMessageId", 1, True).Value = message_id
+    if send_account is not None:
+        # Bind the account BEFORE the first Save so the draft is created in
+        # the requested account's store from the start.  Assigning
+        # SendUsingAccount after Save can be silently reverted by Outlook.
+        mail.SendUsingAccount = send_account
+        # Also stamp the PR_SENT_REPRESENTING_* properties so Exchange does
+        # not rewrite the From address back to the profile's default mailbox
+        # when the requested account has Send-As / Send-on-Behalf rights.
+        try:
+            mail.SentOnBehalfOfName = send_account.SmtpAddress
+        except Exception:
+            # SentOnBehalfOfName is optional; SendUsingAccount alone is still
+            # honored on standard (non-delegated) profiles.
+            pass
     mail.Save()
     if send_account is not None:
-        # Outlook can reset a sender selected on an unsaved message when the
-        # first Save creates its Drafts/Outbox item.  Select and persist the
-        # account only after that save, immediately before Send.
+        # Re-assert the account after Save: Outlook is known to reset
+        # SendUsingAccount when the first Save materializes the draft in a
+        # store, so we bind it again immediately before Send.
         mail.SendUsingAccount = send_account
         mail.Save()
+        # Verify the binding actually stuck; fail loudly instead of silently
+        # sending from the wrong mailbox.
+        try:
+            bound_smtp = str(mail.SendUsingAccount.SmtpAddress).casefold()
+        except Exception:
+            bound_smtp = ""
+        if bound_smtp != sender_address.casefold():
+            raise RuntimeError(
+                f"Outlook이 발신 계정을 {sender_address}(으)로 설정하지 못했습니다. "
+                f"(현재 바인딩: {bound_smtp or '알 수 없음'}). "
+                "Outlook에서 해당 계정의 '보낸 사람으로 사용' 권한을 확인해 주세요."
+            )
     mail.Send()
     # ``Send`` queues the item in Outlook; it is not evidence that mail has
     # already left the Outbox.  Record the truthful immediate state first.
     # A later folder reconciliation can promote this to ``발송 완료``.
     return "발송 대기", message_id
+
+
+def _list_outlook_smtp_addresses(outlook) -> str:
+    """Return a comma-separated list of SMTP addresses configured in Outlook."""
+    addresses = []
+    try:
+        for index in range(1, outlook.Session.Accounts.Count + 1):
+            try:
+                addresses.append(str(outlook.Session.Accounts.Item(index).SmtpAddress))
+            except Exception:
+                continue
+    except Exception:
+        return ""
+    return ", ".join(addr for addr in addresses if addr)
 
 
 def outlook_delivery_status(message_id: str) -> str:
