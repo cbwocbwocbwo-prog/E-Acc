@@ -13,6 +13,7 @@ from decimal import Decimal
 from html import escape
 import json
 import os
+import time
 from pathlib import Path
 from typing import Iterable
 from uuid import uuid4
@@ -21,6 +22,13 @@ from uuid import uuid4
 MAIL_SUBJECT = "[법인카드] 미등록 사용내역 등록 요청"
 LOCAL_SENDER_SETTINGS_FILENAME = "mail_sender.json"
 OL_FOLDER_DRAFTS = 16
+
+# Per-message pacing (seconds) between consecutive Send calls.  A small delay
+# lets Exchange finish processing the previous message and avoids the
+# throttling that otherwise freezes Outlook (and the calling app's UI thread)
+# on bulk-send runs of tens of messages.  Empirically 0.3s is a good trade
+# between throughput and reliability on Exchange-hosted profiles.
+BULK_SEND_PACING_SECONDS = 0.3
 
 
 @dataclass(frozen=True, slots=True)
@@ -84,7 +92,61 @@ def render_mail_html(
 </td></tr></table></body></html>"""
 
 
-def send_via_outlook(recipient: MailRecipient, html_body: str) -> tuple[str, str]:
+class OutlookSendContext:
+    """A reusable Outlook COM handle plus resolved sender-account binding.
+
+    Bulk-send runs call ``Dispatch("Outlook.Application")`` and re-resolve
+    the sender account for every message when they use the simple
+    ``send_via_outlook`` entry point.  On profiles with several dozen
+    recipients each of those COM round-trips adds up, keeps the UI thread
+    marshalled to Outlook, and interacts badly with Exchange throttling,
+    which is exactly the "PC frozen for minutes" symptom.
+
+    This context is built ONCE per bulk run and reused for every message,
+    so the expensive discovery work happens a single time.
+    """
+
+    __slots__ = ("outlook", "send_account", "sender_address", "last_send_at")
+
+    def __init__(self, outlook, send_account, sender_address: str) -> None:
+        self.outlook = outlook
+        self.send_account = send_account
+        # Cache the SMTP address as a plain string so the hot path never has
+        # to cross the COM boundary just to compare against a config value.
+        self.sender_address = sender_address
+        self.last_send_at = 0.0
+
+
+def open_outlook_send_context() -> OutlookSendContext:
+    """Build a bulk-send context: resolve Outlook + the sender account once.
+
+    Raises the same errors ``send_via_outlook`` would raise, so the caller
+    can surface configuration problems before the first message is queued.
+    """
+    try:
+        import win32com.client  # type: ignore[import-not-found]
+    except ImportError as exc:
+        raise RuntimeError("Outlook 자동화 구성요소(pywin32)를 찾을 수 없습니다.") from exc
+    outlook = win32com.client.Dispatch("Outlook.Application")
+    sender_address = _local_sender_address()
+    send_account = None
+    if sender_address:
+        send_account = _find_outlook_account(outlook, sender_address)
+        if send_account is None:
+            available = _list_outlook_smtp_addresses(outlook)
+            raise RuntimeError(
+                f"로컬 발신 계정({sender_address})을 Outlook에서 찾을 수 없습니다. "
+                f"현재 Outlook에 구성된 계정: {available or '(없음)'}. "
+                "이 PC의 Outlook 계정 설정 또는 mail_sender.json을 확인해 주세요."
+            )
+    return OutlookSendContext(outlook, send_account, sender_address)
+
+
+def send_via_outlook(
+    recipient: MailRecipient,
+    html_body: str,
+    context: OutlookSendContext | None = None,
+) -> tuple[str, str]:
     """Ask the locally configured Outlook client to deliver one HTML message.
 
     A successful return means Outlook accepted ``Send``.  It does not claim
@@ -96,28 +158,31 @@ def send_via_outlook(recipient: MailRecipient, html_body: str) -> tuple[str, str
          specific Outlook account (this PC override).
       2) Otherwise the profile's default Outlook account is used
          (the correct behavior for deployment).
+
+    When ``context`` is provided the expensive Outlook discovery work is
+    skipped and per-message pacing is applied automatically, which is the
+    right thing to do inside a bulk-send loop.  Callers that only send
+    one-off messages can omit it; a fresh single-use context is created
+    transparently in that case.
     """
     if not recipient.email or "@" not in recipient.email:
         raise ValueError("유효한 수신자 이메일 주소가 없습니다.")
-    try:
-        import win32com.client  # type: ignore[import-not-found]
-    except ImportError as exc:
-        raise RuntimeError("Outlook 자동화 구성요소(pywin32)를 찾을 수 없습니다.") from exc
-    outlook = win32com.client.Dispatch("Outlook.Application")
+
+    owns_context = context is None
+    if context is None:
+        context = open_outlook_send_context()
+    else:
+        # Space consecutive Send() calls out so Exchange doesn't throttle
+        # (and Outlook doesn't wedge the UI thread waiting for a response).
+        elapsed = time.monotonic() - context.last_send_at
+        if 0 < elapsed < BULK_SEND_PACING_SECONDS:
+            time.sleep(BULK_SEND_PACING_SECONDS - elapsed)
+
+    outlook = context.outlook
+    send_account = context.send_account
+    sender_address = context.sender_address
     message_id = uuid4().hex
-    sender_address = _local_sender_address()
-    send_account = None
-    if sender_address:
-        send_account = _find_outlook_account(outlook, sender_address)
-        if send_account is None:
-            # List every SMTP address Outlook currently knows about so the
-            # user can see why the requested override could not be honored.
-            available = _list_outlook_smtp_addresses(outlook)
-            raise RuntimeError(
-                f"로컬 발신 계정({sender_address})을 Outlook에서 찾을 수 없습니다. "
-                f"현재 Outlook에 구성된 계정: {available or '(없음)'}. "
-                "이 PC의 Outlook 계정 설정 또는 mail_sender.json을 확인해 주세요."
-            )
+
     if send_account is None:
         # Deployment path: no override -> use the profile's default account.
         mail = outlook.CreateItem(0)  # 0 = olMailItem
@@ -153,15 +218,14 @@ def send_via_outlook(recipient: MailRecipient, html_body: str) -> tuple[str, str
             # a store-hosted item; safe to ignore because the store binding
             # already selects the sender.
             pass
+    # A single Save materializes the draft in the target store and gives
+    # Outlook a stable object to bind SendUsingAccount to.  The previous
+    # code saved twice (once before and once after re-asserting the
+    # account) - the second Save doubled per-message COM/disk cost with
+    # no observed benefit now that the draft is created directly inside
+    # the requested account's Drafts folder.
     mail.Save()
     if send_account is not None:
-        # Re-assert the account after Save (Outlook can reset it while the
-        # draft materializes in its store).
-        try:
-            mail.SendUsingAccount = send_account
-            mail.Save()
-        except Exception:
-            pass
         # Verify the binding actually stuck; fail loudly instead of silently
         # sending from the wrong mailbox.
         bound_smtp = _resolve_bound_sender_smtp(mail)
@@ -173,6 +237,11 @@ def send_via_outlook(recipient: MailRecipient, html_body: str) -> tuple[str, str
                 "기본 데이터 파일(파일 → 계정 설정 → 데이터 파일)을 확인해 주세요."
             )
     mail.Send()
+    # Record when the Send() call returned so the next bulk-send iteration
+    # can pace itself relative to it.  Only meaningful when the caller
+    # reuses this context; one-off sends drop it on the floor immediately.
+    if not owns_context:
+        context.last_send_at = time.monotonic()
     # ``Send`` queues the item in Outlook; it is not evidence that mail has
     # already left the Outbox.  Record the truthful immediate state first.
     # A later folder reconciliation can promote this to ``발송 완료``.

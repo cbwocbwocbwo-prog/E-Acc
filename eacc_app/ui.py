@@ -27,7 +27,7 @@ from .browser_automation import (
     ReceiptNotAvailable,
 )
 from .employee_directory import EmployeeDirectoryError, load_employee_names, load_mail_recipients
-from .mail_notifications import MAIL_SUBJECT, MailRecipient, UnprocessedCardUse, outlook_delivery_status, render_mail_html, send_via_outlook
+from .mail_notifications import MAIL_SUBJECT, MailRecipient, UnprocessedCardUse, open_outlook_send_context, outlook_delivery_status, render_mail_html, send_via_outlook
 from .merchant_lookup import (
     BizNoLookupClient,
     MerchantLookupError,
@@ -1863,10 +1863,35 @@ class EAccApplication(tb.Window):
                 grouped.setdefault(recipient, []).append(use)
         for use, status in problems:
             self.repository.record_mail_log(recipient_name=use.employee_name, recipient_email="", department=use.department, transaction_ids=(use.transaction_id,), subject=MAIL_SUBJECT, status=status, reason="수신자를 확정할 수 없어 메일을 발송하지 않았습니다.")
-        for recipient, uses in grouped.items():
+        # Build the Outlook COM handle + resolved sender account ONCE and
+        # reuse it for every recipient in this bulk run.  Previously each
+        # call to ``send_via_outlook`` re-did ``Dispatch("Outlook.Application")``
+        # and re-scanned ``Session.Accounts``; multiplied by 70 recipients
+        # that produced ~500 COM round-trips against a synchronising Outlook
+        # profile, which was the main reason the desktop UI froze for
+        # several minutes on bulk runs.  The context also paces successive
+        # ``Send`` calls (~0.3s each) so Exchange has time to accept them
+        # without throttling - throttling is what turned an ordinary slow
+        # loop into a multi-minute PC-wide stall.
+        try:
+            send_context = open_outlook_send_context()
+        except Exception as exc:
+            # If Outlook itself is unreachable, log every remaining group as
+            # a failure so the user gets a clear per-recipient audit trail
+            # instead of one opaque error at the top of the run.
+            for recipient, uses in grouped.items():
+                ids = tuple(use.transaction_id for use in uses)
+                self.repository.record_mail_log(recipient_name=recipient.name, recipient_email=recipient.email, department=recipient.department, transaction_ids=ids, subject=MAIL_SUBJECT, status="발송 실패", reason=str(exc))
+            self.after(0, self._on_unprocessed_mail_finished)
+            return
+        total = len(grouped)
+        for index, (recipient, uses) in enumerate(grouped.items(), start=1):
             ids = tuple(use.transaction_id for use in uses)
+            # Update the busy banner so the user can see progress instead
+            # of a static "발송 중..." message during a long bulk run.
+            self.after(0, self._set_busy, True, f"Outlook 안내메일 발송 중 ({index}/{total})...")
             try:
-                status, outlook_message_id = send_via_outlook(recipient, render_mail_html(recipient.name, uses))
+                status, outlook_message_id = send_via_outlook(recipient, render_mail_html(recipient.name, uses), context=send_context)
             except Exception as exc:
                 self.repository.record_mail_log(recipient_name=recipient.name, recipient_email=recipient.email, department=recipient.department, transaction_ids=ids, subject=MAIL_SUBJECT, status="발송 실패", reason=str(exc))
             else:
