@@ -1366,32 +1366,57 @@ class EAccountingBrowserService:
                 if not candidate.is_closed() and "/account/real_store_mgt.jsp" in candidate.url:
                     candidate.close()
             target_token = f"eacc-real-store-{transaction.transaction_id}"
+            # F12 콘솔 진단(2026-09-09) 결과 확정된 사실:
+            #   - 컬럼 ID 'SELECTED'는 index 0의 체크박스 컬럼이다(돋보기 아님).
+            #   - 진짜 돋보기 컬럼은 index 23, ID 'STORE_ICON', 라벨 '선택'이다.
+            #   - 이 컬럼의 <td>는 평소 style="display: none"으로 숨어 있고,
+            #     행이 활성/선택 상태일 때 e-Acc가 display를 풀어서 보여준다.
+            # 따라서 이 함수는 (1) STORE_ICON 셀을 찾아 (2) 강제로 display를
+            # 해제한 뒤 (3) 가로 스크롤을 오른쪽 끝으로 옮긴다.
             prepared_cell = main_frame.evaluate(
                 """
                 target => {
                     const {rowId, token} = target;
-                    const selectedColumn = GridObj.getColIndexById('SELECTED');
-                    if (selectedColumn < 0) return {prepared: false, reason: '선택 열 없음'};
-                    const cell = GridObj.cells(rowId, selectedColumn).cell;
-                    if (!cell) return {prepared: false, reason: '선택 셀 없음'};
+                    // 돋보기 컬럼: F12에서 확인한 실제 ID는 STORE_ICON.
+                    // 예전 코드는 'SELECTED'로 조회해서 index 0(체크박스)를
+                    // 반환받고 있었다.
+                    let iconColumn = GridObj.getColIndexById('STORE_ICON');
+                    if (iconColumn < 0) {
+                        // 만약 다른 화면에서 컬럼 ID가 다르게 정의돼 있으면
+                        // 라벨이 '선택'인 컬럼을 찾아 대체한다(안전망).
+                        for (let i = 0; i < GridObj.getColumnsNum(); i++) {
+                            if ((GridObj.getColLabel(i) || '').trim() === '선택') {
+                                iconColumn = i;
+                                break;
+                            }
+                        }
+                    }
+                    if (iconColumn < 0) return {prepared: false, reason: '돋보기(STORE_ICON) 열을 찾지 못함'};
+                    const cellApi = GridObj.cells(rowId, iconColumn);
+                    if (!cellApi || !cellApi.cell) return {prepared: false, reason: '돋보기 셀 없음'};
+                    const cell = cellApi.cell;
                     cell.setAttribute('data-eacc-real-store-target', token);
-                    const rowIds = GridObj.getAllRowIds().split(',').filter(Boolean);
-                    const rowIndex = rowIds.indexOf(String(rowId));
-                    if (rowIndex < 0) return {prepared: false, reason: '선택 행 위치 없음'};
 
-                    // e-Acc의 구형 DHTMLX Grid에서 가로 스크롤의 실제 주체는
-                    // GridObj.objBox다. selectCell(..., show=true)는 세로 행만
-                    // 보이게 할 수 있어 선택 열(오른쪽 끝)을 표시하지 못한다.
-                    // 따라서 objBox의 scrollLeft를 명시적으로 최대값으로 옮긴다.
+                    // 돋보기 셀은 평소 style="display: none"으로 숨겨져 있다.
+                    // Playwright.dblclick()은 display:none 요소에 클릭을
+                    // 전달하지 못하므로 명시적으로 display를 해제한다.
+                    // 원래 값은 나중에 되돌릴 수 있게 저장해둔다.
+                    if (cell.style.display === 'none' || getComputedStyle(cell).display === 'none') {
+                        cell.setAttribute('data-eacc-real-store-display', cell.style.display || '');
+                        cell.style.display = '';
+                    }
+
+                    // 가로 스크롤 오른쪽 끝으로 이동 (예전 로직 유지)
                     const objBox = GridObj.objBox;
                     if (!objBox) return {prepared: false, reason: '그리드 가로 스크롤 영역(objBox) 없음'};
                     const maxScrollLeft = Math.max(0, objBox.scrollWidth - objBox.clientWidth);
                     objBox.scrollLeft = maxScrollLeft;
                     objBox.dispatchEvent(new Event('scroll', {bubbles: true}));
-                    const reachedRightEnd = objBox.scrollLeft >= Math.max(0, maxScrollLeft - 1);
+
                     return {
-                        prepared: reachedRightEnd,
-                        reason: reachedRightEnd ? '' : '가로 스크롤을 오른쪽 끝으로 이동하지 못함',
+                        prepared: true,
+                        iconColumn,
+                        iconColumnId: GridObj.getColumnId(iconColumn),
                         scrollLeft: objBox.scrollLeft,
                         maxScrollLeft,
                     };
@@ -1404,14 +1429,9 @@ class EAccountingBrowserService:
                 raise ActualMerchantRegistrationError(
                     f"실구매처 등록용 선택 돋보기 셀을 찾지 못했습니다: {reason}"
                 )
-            # dispatchEvent()는 자바스크립트가 만든 비신뢰 이벤트라 e-Acc가
-            # 팝업을 열지 않는다. F12에서 확인한 실제 동작 대상은 이미지 자체가
-            # 아니라 ``<td class="cellselected">`` 선택 셀이다. 따라서 이미지
-            # locator가 아니라 이 TD에 Playwright의 실제 마우스 더블클릭을 보낸다.
-            # 위에서 선택 열을 화면 안으로 먼저 옮겼으므로 force 클릭을 쓰지
-            # 않는다. 즉, 스크롤·가림 문제를 억지로 무시하지 않고 실제 사람이
-            # 누를 수 있는 상태가 된 뒤 클릭한다. 구형 그리드는 첫 클릭으로 선택
-            # 상태를 반영한 뒤 두 번째 클릭을 처리하므로 사람의 더블클릭 간격을 둔다.
+            # 이제 진짜 돋보기 <td>가 화면에 보이는 상태다. 이 셀 안의
+            # <img src="/images/button/bt_search.gif">를 직접 더블클릭하여
+            # e-Acc가 real_store_mgt.jsp 팝업을 열게 한다.
             cell = main_frame.locator(
                 f'td[data-eacc-real-store-target="{target_token}"]'
             )
@@ -1424,10 +1444,15 @@ class EAccountingBrowserService:
             visible = cell.evaluate(
                 """
                 element => {
-                    const grid = GridObj.objBox;
+                    const style = getComputedStyle(element);
+                    if (style.display === 'none' || style.visibility === 'hidden') return false;
                     const rect = element.getBoundingClientRect();
+                    if (rect.width === 0 || rect.height === 0) return false;
+                    const grid = GridObj.objBox;
+                    if (!grid) return true;
                     const gridRect = grid.getBoundingClientRect();
-                    return rect.left >= gridRect.left && rect.right <= gridRect.right;
+                    // 셀이 그리드 뷰포트 안에 들어와 있는지 확인
+                    return rect.left < gridRect.right && rect.right > gridRect.left;
                 }
                 """
             )
@@ -1435,7 +1460,14 @@ class EAccountingBrowserService:
                 raise ActualMerchantRegistrationError(
                     "선택 돋보기 열을 가로 스크롤 오른쪽 끝으로 옮겼지만 화면 안에 표시되지 않았습니다."
                 )
-            cell.dblclick(timeout=10_000, delay=250)
+            # TD가 아니라 그 안의 IMG(돋보기)에 더블클릭을 보낸다.
+            # 구형 DHTMLX excell 렌더러는 IMG 위의 실제 사람 더블클릭에만
+            # 팝업 오픈 이벤트를 발화시킨다.
+            search_img = cell.locator('img[src="/images/button/bt_search.gif"]')
+            if search_img.count() != 1:
+                # 이미지가 아직 렌더되지 않은 아주 짧은 순간 대비. 최소한 TD에라도.
+                search_img = cell
+            search_img.dblclick(timeout=10_000, delay=250)
             deadline = time.monotonic() + 10
             while time.monotonic() < deadline:
                 popup = next(
