@@ -2443,7 +2443,27 @@ class EAccWebApi:
         self._app.after(0, self._app._register_selected_actual_merchant)
 
     def show_guide(self) -> None:
+        # 이 창은 이제 웹뷰(HTML/JS)에서 모달로 표시한다. 예전 tkinter
+        # Toplevel 방식은 pywebview 창 뒤에 숨어서 "안 뜨는 것처럼"
+        # 보이는 문제가 있었다. tkinter 폴백은 웹뷰가 아예 붙기 전
+        # 예외 상황용으로만 유지한다.
         self._app.after(0, self._app._show_validation_criteria)
+
+    def get_validation_criteria(self) -> dict:
+        """웹 모달용 원본 데이터. tkinter 창을 띄우지 않는다."""
+        return {
+            "title": "법인카드 검증 기준",
+            "subtitle": "현재 프로그램에 적용된 자동 검증 기준입니다. 상세 처리 이력은 Log 탭에서 확인할 수 있습니다.",
+            "columns": ["구분", "대상 계정·업종", "검증 기준", "예외처리 사유"],
+            "rows": [
+                ["공통 영수증", "증빙유무 #", "승인번호·증빙일자·사용금액을 영수증 OCR 값과 비교", "영수증 OCR 불일치"],
+                ["PG 처리", "업종에 PG일반 포함", "사업자번호 OCR → 비즈노 상호조회 → 실구매처 등록", "PG 조회·등록 확인 필요"],
+                ["계정별", "특근자식비", "15,000원당 인정 직원 최소 1명 확인", "특근자식비 사용인원 불충족"],
+                ["계정별", "차량유지비-유류대·주차비·세차비·통행료", "영수증 키워드와 계정 유형을 비교", "계정과 상이한 영수증 첨부"],
+                ["계정별", "일반복리비-현장지원 (현장대리인 활동지원 식음료대)", "20만원 초과, 주류 문구, 적요 작성 여부 확인", "사용금액 초과 / 주류 포함 / 불필요한 적요 작성"],
+                ["계정별", "회의비·부서회의비·업무회의비·일반복리비", "자동 결재 제외", "계정별 예외처리"],
+            ],
+        }
 
     def open_mail_window(self) -> None:
         self._app.after(0, self._app._run_unprocessed_mail_process)

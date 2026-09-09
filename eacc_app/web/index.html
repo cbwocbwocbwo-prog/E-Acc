@@ -235,6 +235,48 @@
   .status-pill.info { color: var(--info); } .status-pill.info .dot { background: var(--info); }
 
   .table-footer { margin-top: 10px; display: flex; justify-content: space-between; font-size: 11.5px; color: var(--text-faint); }
+
+  /* 검증 기준 모달 (기존 tkinter Toplevel을 대체). 웹뷰 뒤로 숨는 문제
+     자체를 없애기 위해 웹 화면 안에서 오버레이로 표시한다. */
+  .modal-overlay {
+    position: fixed; inset: 0; background: rgba(6, 10, 18, 0.62);
+    display: none; align-items: center; justify-content: center;
+    z-index: 1000; padding: 24px;
+  }
+  .modal-overlay.open { display: flex; }
+  .modal-card {
+    background: var(--surface-1); color: var(--text-primary);
+    border: 1px solid var(--border); border-radius: var(--radius-md);
+    width: min(1120px, 96vw); max-height: 88vh; display: flex; flex-direction: column;
+    box-shadow: 0 20px 60px rgba(0, 0, 0, 0.45);
+  }
+  .modal-card header {
+    padding: 18px 22px 6px; border-bottom: 1px solid var(--border-soft);
+  }
+  .modal-card header h2 { margin: 0; font-size: 17px; font-weight: 600; }
+  .modal-card header p { margin: 6px 0 12px; font-size: 12px; color: var(--text-secondary); }
+  .modal-card .modal-body { padding: 12px 22px; overflow: auto; flex: 1; }
+  .modal-card .modal-body table { border-collapse: collapse; width: 100%; }
+  .modal-card .modal-body th {
+    background: var(--surface-2); text-align: left; font-size: 12px; font-weight: 600;
+    color: var(--text-secondary); padding: 9px 12px; border-bottom: 1px solid var(--border);
+    position: sticky; top: 0;
+  }
+  .modal-card .modal-body td {
+    padding: 9px 12px; font-size: 12.5px; border-bottom: 1px solid var(--border-soft);
+    vertical-align: top;
+  }
+  .modal-card .modal-body td.center { text-align: center; }
+  .modal-card footer {
+    padding: 12px 22px 18px; border-top: 1px solid var(--border-soft);
+    display: flex; justify-content: flex-end; gap: 8px;
+  }
+  .modal-card footer button {
+    background: var(--accent); color: #fff; border: none;
+    border-radius: var(--radius-sm); padding: 7px 18px; font-size: 12.5px;
+    font-family: inherit; cursor: pointer;
+  }
+  .modal-card footer button:hover { filter: brightness(1.1); }
 </style>
 </head>
 <body>
@@ -297,7 +339,7 @@
         <div class="cap">현재 단계</div>
         <div class="now" id="stageText">자동 처리 시작 전</div>
       </div>
-      <div class="guide-link" onclick="callApi('show_guide')">법인카드 검증 기준 →</div>
+      <div class="guide-link" onclick="openGuideModal()">법인카드 검증 기준 →</div>
     </div>
 
     <div class="toolbar-row">
@@ -313,6 +355,24 @@
       <span id="syncedAtText" style="color: var(--text-faint);">Python 연결 대기 중...</span>
     </div>
   </main>
+</div>
+
+<!-- 법인카드 검증 기준: 웹뷰 안에서 모달로 표시한다. 예전엔 tkinter
+     Toplevel을 띄웠는데 pywebview 창 뒤로 숨는 문제가 있어서 웹으로
+     이동했다. 실제 표시는 openGuideModal() / closeGuideModal()에서 한다. -->
+<div class="modal-overlay" id="guideModal" onclick="onGuideOverlayClick(event)">
+  <div class="modal-card" role="dialog" aria-modal="true" aria-labelledby="guideModalTitle">
+    <header>
+      <h2 id="guideModalTitle">법인카드 검증 기준</h2>
+      <p id="guideModalSubtitle"></p>
+    </header>
+    <div class="modal-body">
+      <table id="guideModalTable"><thead></thead><tbody></tbody></table>
+    </div>
+    <footer>
+      <button type="button" onclick="closeGuideModal()">닫기</button>
+    </footer>
+  </div>
 </div>
 
 <script>
@@ -350,6 +410,65 @@ function selectRow(tabId, rowId) {
     tr.classList.toggle('selected', tr.dataset.rowId === rowId);
   });
 }
+
+/* ---------- 법인카드 검증 기준 모달 ----------
+   기존엔 파이썬 쪽 _show_validation_criteria()가 tk.Toplevel을 띄웠는데
+   pywebview 창 뒤에 숨어 안 보이는 문제가 있었다. 이제는 파이썬은 데이터만
+   내려주고 표시는 웹에서 모달로 한다. */
+function escapeHtml(text) {
+  return String(text == null ? "" : text)
+    .replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;")
+    .replace(/"/g, "&quot;").replace(/'/g, "&#39;");
+}
+
+function fillGuideModal(data) {
+  if (!data) return;
+  const overlay = document.getElementById("guideModal");
+  document.getElementById("guideModalTitle").textContent = data.title || "법인카드 검증 기준";
+  document.getElementById("guideModalSubtitle").textContent = data.subtitle || "";
+  const table = document.getElementById("guideModalTable");
+  const columns = data.columns || [];
+  const rows = data.rows || [];
+  table.querySelector("thead").innerHTML =
+    "<tr>" + columns.map(c => `<th>${escapeHtml(c)}</th>`).join("") + "</tr>";
+  table.querySelector("tbody").innerHTML = rows.length
+    ? rows.map(row => "<tr>" + row.map((cell, idx) => {
+        const cls = idx === 0 ? ' class="center"' : "";
+        return `<td${cls}>${escapeHtml(cell)}</td>`;
+      }).join("") + "</tr>").join("")
+    : `<tr><td colspan="${columns.length}" class="center">표시할 항목이 없습니다.</td></tr>`;
+  overlay.classList.add("open");
+}
+
+function openGuideModal() {
+  // 첫 클릭 즉시 모달을 열어두고, 파이썬에서 실제 내용을 가져와 채운다.
+  // 이러면 파이썬 응답이 늦어도 사용자에게는 반응이 즉시 보인다.
+  fillGuideModal({
+    title: "법인카드 검증 기준",
+    subtitle: "불러오는 중...",
+    columns: ["구분", "대상 계정·업종", "검증 기준", "예외처리 사유"],
+    rows: [],
+  });
+  const result = callApi("get_validation_criteria");
+  if (result && typeof result.then === "function") {
+    result.then(data => { if (data) fillGuideModal(data); }).catch(() => {});
+  } else if (result) {
+    fillGuideModal(result);
+  }
+}
+
+function closeGuideModal() {
+  document.getElementById("guideModal").classList.remove("open");
+}
+
+function onGuideOverlayClick(event) {
+  // 카드 바깥(오버레이)을 눌렀을 때만 닫는다. 안쪽 클릭은 통과.
+  if (event.target && event.target.id === "guideModal") closeGuideModal();
+}
+
+document.addEventListener("keydown", event => {
+  if (event.key === "Escape") closeGuideModal();
+});
 
 /* ---------- 탭/표 정의 ---------- */
 const TAB_DEFS = {
@@ -490,7 +609,24 @@ function renderTable(tabId) {
       return `<tr class="${selected.trim()}" data-row-id="${row.id}" onclick="selectRow('${tabId}','${row.id}')">${cells}</tr>`;
     }).join("") + "</tbody>";
   }
+
+  // 스크롤 위치 보존:
+  //   기존 코드는 panel.innerHTML = ...로 스크롤 컨테이너(.table-scroll)를
+  //   매번 통째로 새로 만들어서, 파이썬 쪽에서 상태를 재갱신할 때마다
+  //   사용자가 방금 드래그한 가로 스크롤이 0으로 리셋됐다.
+  //   → 갱신 직전에 현재 scrollLeft/scrollTop을 기억해뒀다가
+  //     새 컨테이너에 즉시 복원한다.
+  const oldScroll = panel.querySelector(".table-scroll");
+  const prevScrollLeft = oldScroll ? oldScroll.scrollLeft : 0;
+  const prevScrollTop = oldScroll ? oldScroll.scrollTop : 0;
+
   panel.innerHTML = banner + `<div class="table-scroll"><table>${thead}${bodyHtml}</table></div>`;
+
+  const newScroll = panel.querySelector(".table-scroll");
+  if (newScroll) {
+    newScroll.scrollLeft = prevScrollLeft;
+    newScroll.scrollTop = prevScrollTop;
+  }
 }
 
 function renderAllTables() {
