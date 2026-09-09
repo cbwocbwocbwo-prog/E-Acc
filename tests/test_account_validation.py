@@ -67,6 +67,15 @@ class AccountValidationTests(unittest.TestCase):
         self.assertEqual("정상", no_comparable_word.status)
         fuel = validate_account_rules(transaction, (), "주유소 휘발유 35,000원")
         self.assertEqual("정상", fuel.status)
+        # e-영수증 공통 분류 "주유/자동차주차요금"처럼 목표 키워드와
+        # 다른 차량 키워드가 함께 읽혀도, 목표 키워드가 있으면 통과시킨다.
+        mixed_parking = validate_account_rules(
+            replace(transaction, account_name="차량유지비-주차비"),
+            (),
+            "주유/자동차주차요금 아마노코리아(주) 16,100원",
+        )
+        self.assertEqual("정상(i)", mixed_parking.status)
+        self.assertIn("차량유지비-주차비 OCR 키워드 포함 확인", mixed_parking.reason_text)
         parking = validate_account_rules(transaction, (), "주차요금 5,000원")
         self.assertEqual("예외", parking.status)
         self.assertEqual("계정과 상이한 영수증 첨부", parking.reason_text)

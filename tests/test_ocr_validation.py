@@ -46,18 +46,46 @@ class OcrValidationTests(unittest.TestCase):
         self.assertEqual("정상", result.status)
         self.assertTrue(all(check.is_match for check in result.checks))
 
-    def test_missing_approval_number_is_reported_as_abnormal(self) -> None:
+    def test_missing_approval_number_with_matching_date_and_amount_is_two_field_normal(self) -> None:
         result = evaluate_ocr_text(
             _transaction(),
             "승인NO 99999999 승인일시 260828083815 합계금액 45,000원",
         )
 
-        self.assertEqual("이상", result.status)
+        self.assertEqual("정상(2)", result.status)
         approval = result.checks[0]
         self.assertFalse(approval.is_match)
         self.assertIn("023200102", approval.reason)
         self.assertTrue(result.checks[1].is_match)
         self.assertTrue(result.checks[2].is_match)
+        self.assertTrue(result.is_approval_eligible)
+
+    def test_approval_number_and_amount_match_is_two_field_normal(self) -> None:
+        result = evaluate_ocr_text(
+            _transaction(),
+            "승인번호 023200102 승인일시 2026-08-29 합계금액 45,000원",
+        )
+
+        self.assertEqual("정상(2)", result.status)
+        self.assertTrue(result.is_approval_eligible)
+
+    def test_evidence_date_and_amount_match_is_two_field_normal(self) -> None:
+        result = evaluate_ocr_text(
+            _transaction(),
+            "승인번호 99999999 승인일시 2026-08-28 합계금액 45,000원",
+        )
+
+        self.assertEqual("정상(2)", result.status)
+        self.assertTrue(result.is_approval_eligible)
+
+    def test_approval_number_and_date_without_amount_is_not_accepted(self) -> None:
+        result = evaluate_ocr_text(
+            _transaction(),
+            "승인번호 023200102 승인일시 2026-08-28 합계금액 44,000원",
+        )
+
+        self.assertEqual("이상", result.status)
+        self.assertFalse(result.is_approval_eligible)
 
     def test_segmented_approval_and_supply_vat_sum_are_accepted(self) -> None:
         transaction = replace(

@@ -116,6 +116,33 @@ class LoginCredentials:
 
 
 @dataclass(frozen=True, slots=True)
+class CurrentEAccTarget:
+    """One e-Acc row together with its live visible-list position."""
+
+    transaction: UnsubmittedTransaction
+    row_number: int
+    total_row_count: int
+    grid_row_id: str
+
+
+@dataclass(frozen=True, slots=True)
+class ActualMerchantPreparation:
+    """A populated real-merchant popup and the position rechecked just before it opened."""
+
+    message: str
+    row_number: int
+    total_row_count: int
+    grid_row_id: str
+
+
+@dataclass(frozen=True, slots=True)
+class _GridRowLocation:
+    row_id: str
+    row_number: int
+    total_row_count: int
+
+
+@dataclass(frozen=True, slots=True)
 class _CollectCommand:
     credentials: LoginCredentials | None
     on_success: Callable[[Path], None]
@@ -126,7 +153,7 @@ class _CollectCommand:
 class _CurrentTargetCommand:
     credentials: LoginCredentials | None
     excluded_transaction_ids: frozenset[str]
-    on_success: Callable[[UnsubmittedTransaction], None]
+    on_success: Callable[[CurrentEAccTarget], None]
     on_error: Callable[[Exception], None]
 
 
@@ -146,11 +173,31 @@ class _ReceiptCommand:
 
 
 @dataclass(frozen=True, slots=True)
-class _ActualMerchantRegistrationCommand:
+class _PrepareActualMerchantRegistrationCommand:
+    """Open the real-merchant popup and fill it, without registering yet."""
+
     transaction: UnsubmittedTransaction
     business_number: str
     merchant_name: str
     credentials: LoginCredentials | None
+    on_success: Callable[[ActualMerchantPreparation], None]
+    on_error: Callable[[Exception], None]
+
+
+@dataclass(frozen=True, slots=True)
+class _SubmitActualMerchantRegistrationCommand:
+    """Click 등록 only after the user has confirmed the populated values."""
+
+    transaction: UnsubmittedTransaction
+    on_success: Callable[[str], None]
+    on_error: Callable[[Exception], None]
+
+
+@dataclass(frozen=True, slots=True)
+class _ResetActualMerchantRegistrationCommand:
+    """Clear a declined real-merchant popup and accept its confirmation alerts."""
+
+    transaction: UnsubmittedTransaction
     on_success: Callable[[str], None]
     on_error: Callable[[Exception], None]
 
@@ -212,7 +259,9 @@ class EAccountingBrowserService:
             | _CurrentTargetCommand
             | _UnprocessedCardCommand
             | _ReceiptCommand
-            | _ActualMerchantRegistrationCommand
+            | _PrepareActualMerchantRegistrationCommand
+            | _SubmitActualMerchantRegistrationCommand
+            | _ResetActualMerchantRegistrationCommand
             | _OpenApprovalLineCommand
             | _SubmitApprovalCommand
             | _CancelApprovalLineCommand
@@ -227,6 +276,8 @@ class EAccountingBrowserService:
         # id(popup)는 객체 수명 뒤에 재사용될 수 있으므로, 실제 Popup 객체로
         # 같은 결재선 창인지 판별한다.
         self._prepared_approval_popup_object = None
+        self._prepared_actual_merchant_transaction_id: str | None = None
+        self._prepared_actual_merchant_popup_object = None
         self._thread = threading.Thread(
             target=self._worker,
             name="eaccounting-browser-worker",
@@ -251,7 +302,7 @@ class EAccountingBrowserService:
     def read_current_first_target(
         self,
         credentials: LoginCredentials | None,
-        on_success: Callable[[UnsubmittedTransaction], None],
+        on_success: Callable[[CurrentEAccTarget], None],
         on_error: Callable[[Exception], None],
         excluded_transaction_ids: frozenset[str] = frozenset(),
     ) -> None:
@@ -285,7 +336,7 @@ class EAccountingBrowserService:
             _ReceiptCommand(transaction, credentials, on_success, on_error)
         )
 
-    def register_actual_merchant(
+    def prepare_actual_merchant_registration(
         self,
         transaction: UnsubmittedTransaction,
         business_number: str,
@@ -294,9 +345,9 @@ class EAccountingBrowserService:
         on_success: Callable[[str], None],
         on_error: Callable[[Exception], None],
     ) -> None:
-        """Register one user-confirmed merchant in the e-Accounting popup."""
+        """Automatically open and populate the e-Acc real-merchant popup."""
         self._commands.put(
-            _ActualMerchantRegistrationCommand(
+            _PrepareActualMerchantRegistrationCommand(
                 transaction=transaction,
                 business_number=business_number,
                 merchant_name=merchant_name,
@@ -304,6 +355,28 @@ class EAccountingBrowserService:
                 on_success=on_success,
                 on_error=on_error,
             )
+        )
+
+    def submit_prepared_actual_merchant_registration(
+        self,
+        transaction: UnsubmittedTransaction,
+        on_success: Callable[[str], None],
+        on_error: Callable[[Exception], None],
+    ) -> None:
+        """Register only the real-merchant popup prepared for this transaction."""
+        self._commands.put(
+            _SubmitActualMerchantRegistrationCommand(transaction, on_success, on_error)
+        )
+
+    def reset_prepared_actual_merchant_registration(
+        self,
+        transaction: UnsubmittedTransaction,
+        on_success: Callable[[str], None],
+        on_error: Callable[[Exception], None],
+    ) -> None:
+        """Clear a user-declined popup before continuing with the next row."""
+        self._commands.put(
+            _ResetActualMerchantRegistrationCommand(transaction, on_success, on_error)
         )
 
     def open_approval_line(
@@ -486,13 +559,21 @@ class EAccountingBrowserService:
                             command.transaction,
                             command.credentials,
                         )
-                    elif isinstance(command, _ActualMerchantRegistrationCommand):
-                        result = self._register_actual_merchant(
+                    elif isinstance(command, _PrepareActualMerchantRegistrationCommand):
+                        result = self._prepare_actual_merchant_registration(
                             context,
                             command.transaction,
                             command.business_number,
                             command.merchant_name,
                             command.credentials,
+                        )
+                    elif isinstance(command, _SubmitActualMerchantRegistrationCommand):
+                        result = self._submit_prepared_actual_merchant_registration(
+                            context, command.transaction
+                        )
+                    elif isinstance(command, _ResetActualMerchantRegistrationCommand):
+                        result = self._reset_prepared_actual_merchant_registration(
+                            context, command.transaction
                         )
                     else:
                         if isinstance(command, _OpenApprovalLineCommand):
@@ -1033,7 +1114,7 @@ class EAccountingBrowserService:
         context,
         credentials: LoginCredentials | None,
         excluded_transaction_ids: frozenset[str] = frozenset(),
-    ) -> UnsubmittedTransaction:
+    ) -> CurrentEAccTarget:
         """Search by cost center and return the first row not excluded this run."""
         page = self._ensure_eaccounting_page(context, credentials)
         page.bring_to_front()
@@ -1080,7 +1161,12 @@ class EAccountingBrowserService:
                     f"e-Acc {source_row_number}번째 행 형식을 해석하지 못했습니다: {exc}"
                 ) from exc
             if transaction.transaction_id not in excluded_transaction_ids:
-                return transaction
+                return CurrentEAccTarget(
+                    transaction=transaction,
+                    row_number=source_row_number,
+                    total_row_count=len(grid_rows["rows"]),
+                    grid_row_id=str(grid_row["rowId"]),
+                )
         raise NoEligibleTransactions(
             "미상신내역은 남아 있으나, 이번 실행에서 예외처리한 행 외에는 처리 가능 행이 없습니다."
         )
@@ -1242,20 +1328,15 @@ class EAccountingBrowserService:
             if popup is not None and not popup.is_closed():
                 popup.close()
 
-    def _register_actual_merchant(
+    def _prepare_actual_merchant_registration(
         self,
         context,
         transaction: UnsubmittedTransaction,
         business_number: str,
         merchant_name: str,
         credentials: LoginCredentials | None,
-    ) -> str:
-        """Open e-Acc's real-merchant popup and submit one confirmed value.
-
-        The caller has already checked the OCR business number, BizNo result
-        and the user's explicit confirmation.  This method nevertheless refuses
-        to overwrite a row that already has a real merchant name.
-        """
+    ) -> ActualMerchantPreparation:
+        """Open e-Acc's popup and populate the BizNo result for confirmation."""
         if not business_number.isdigit() or len(business_number) != 10:
             raise ActualMerchantRegistrationError("등록할 사업자번호는 하이픈 없는 10자리 숫자여야 합니다.")
         if not merchant_name.strip():
@@ -1265,23 +1346,116 @@ class EAccountingBrowserService:
                 f"이 행에는 이미 실구매처명 '{transaction.actual_merchant_name}'이 등록되어 있어 덮어쓰지 않습니다."
             )
 
-        # e-Acc는 사용자가 선택한 한 행을 기준으로 처리한다. 프로그램이 그리드의
-        # 위치·행 번호를 추측해 팝업을 열지 않고, 사용자가 e-Acc에서 실제 해당 행의
-        # 돋보기를 열면 그 이미 열린 팝업에만 값을 자동 입력·등록한다.
-        popup = next(
-            (
-                candidate
-                for candidate in reversed(context.pages)
-                if not candidate.is_closed()
-                and "/account/real_store_mgt.jsp" in candidate.url
-            ),
-            None,
-        )
-        if popup is None:
-            raise ActualMerchantRegistrationError(
-                "e-Acc에서 현재 처리할 한 행의 '선택' 돋보기를 더블클릭해 실구매처 등록 팝업을 먼저 열어 주세요."
-            )
+        self._prepared_actual_merchant_transaction_id = None
+        self._prepared_actual_merchant_popup_object = None
+        page = self._ensure_eaccounting_page(context, credentials)
+        page.bring_to_front()
+        self._open_card_processing_top_menu(page)
+        self._open_unsubmitted_menu(page)
+        main_frame = self._wait_for_frame(page, "mainFrame")
+        self._query_unsubmitted(main_frame)
+        # PG 입력 직전에도 e-Acc 목록을 다시 확인해 이 거래의 실제 위치와
+        # 기술 행 ID를 확보한다. 화면 갱신 뒤에도 같은 거래에만 입력한다.
+        row = self._find_transaction_grid_row(main_frame, transaction)
+        popup = None
+        prepared = False
         try:
+            # 이전 행의 창을 재사용하면 다른 전표에 잘못 등록될 수 있으므로
+            # 프로그램이 새로 연 현재 행의 창만 사용한다.
+            for candidate in tuple(self._snapshot_pages(context)):
+                if not candidate.is_closed() and "/account/real_store_mgt.jsp" in candidate.url:
+                    candidate.close()
+            target_token = f"eacc-real-store-{transaction.transaction_id}"
+            prepared_cell = main_frame.evaluate(
+                """
+                target => {
+                    const {rowId, token} = target;
+                    const selectedColumn = GridObj.getColIndexById('SELECTED');
+                    if (selectedColumn < 0) return {prepared: false, reason: '선택 열 없음'};
+                    const cell = GridObj.cells(rowId, selectedColumn).cell;
+                    if (!cell) return {prepared: false, reason: '선택 셀 없음'};
+                    cell.setAttribute('data-eacc-real-store-target', token);
+                    const rowIds = GridObj.getAllRowIds().split(',').filter(Boolean);
+                    const rowIndex = rowIds.indexOf(String(rowId));
+                    if (rowIndex < 0) return {prepared: false, reason: '선택 행 위치 없음'};
+
+                    // e-Acc의 구형 DHTMLX Grid에서 가로 스크롤의 실제 주체는
+                    // GridObj.objBox다. selectCell(..., show=true)는 세로 행만
+                    // 보이게 할 수 있어 선택 열(오른쪽 끝)을 표시하지 못한다.
+                    // 따라서 objBox의 scrollLeft를 명시적으로 최대값으로 옮긴다.
+                    const objBox = GridObj.objBox;
+                    if (!objBox) return {prepared: false, reason: '그리드 가로 스크롤 영역(objBox) 없음'};
+                    const maxScrollLeft = Math.max(0, objBox.scrollWidth - objBox.clientWidth);
+                    objBox.scrollLeft = maxScrollLeft;
+                    objBox.dispatchEvent(new Event('scroll', {bubbles: true}));
+                    const reachedRightEnd = objBox.scrollLeft >= Math.max(0, maxScrollLeft - 1);
+                    return {
+                        prepared: reachedRightEnd,
+                        reason: reachedRightEnd ? '' : '가로 스크롤을 오른쪽 끝으로 이동하지 못함',
+                        scrollLeft: objBox.scrollLeft,
+                        maxScrollLeft,
+                    };
+                }
+                """,
+                {"rowId": row.row_id, "token": target_token},
+            )
+            if not prepared_cell or not prepared_cell.get("prepared"):
+                reason = prepared_cell.get("reason", "알 수 없는 이유") if prepared_cell else "선택 셀 확인 실패"
+                raise ActualMerchantRegistrationError(
+                    f"실구매처 등록용 선택 돋보기 셀을 찾지 못했습니다: {reason}"
+                )
+            # dispatchEvent()는 자바스크립트가 만든 비신뢰 이벤트라 e-Acc가
+            # 팝업을 열지 않는다. F12에서 확인한 실제 동작 대상은 이미지 자체가
+            # 아니라 ``<td class="cellselected">`` 선택 셀이다. 따라서 이미지
+            # locator가 아니라 이 TD에 Playwright의 실제 마우스 더블클릭을 보낸다.
+            # 위에서 선택 열을 화면 안으로 먼저 옮겼으므로 force 클릭을 쓰지
+            # 않는다. 즉, 스크롤·가림 문제를 억지로 무시하지 않고 실제 사람이
+            # 누를 수 있는 상태가 된 뒤 클릭한다. 구형 그리드는 첫 클릭으로 선택
+            # 상태를 반영한 뒤 두 번째 클릭을 처리하므로 사람의 더블클릭 간격을 둔다.
+            cell = main_frame.locator(
+                f'td[data-eacc-real-store-target="{target_token}"]'
+            )
+            if cell.count() != 1:
+                raise ActualMerchantRegistrationError(
+                    "실구매처 등록용 선택 셀(TD)을 하나로 찾지 못했습니다."
+                )
+            pages_before = self._snapshot_pages(context)
+            page.wait_for_timeout(150)
+            visible = cell.evaluate(
+                """
+                element => {
+                    const grid = GridObj.objBox;
+                    const rect = element.getBoundingClientRect();
+                    const gridRect = grid.getBoundingClientRect();
+                    return rect.left >= gridRect.left && rect.right <= gridRect.right;
+                }
+                """
+            )
+            if not visible:
+                raise ActualMerchantRegistrationError(
+                    "선택 돋보기 열을 가로 스크롤 오른쪽 끝으로 옮겼지만 화면 안에 표시되지 않았습니다."
+                )
+            cell.dblclick(timeout=10_000, delay=250)
+            deadline = time.monotonic() + 10
+            while time.monotonic() < deadline:
+                popup = next(
+                    (
+                        candidate
+                        for candidate in self._snapshot_pages(context) - pages_before
+                        if not candidate.is_closed()
+                        and "/account/real_store_mgt.jsp" in candidate.url
+                    ),
+                    None,
+                )
+                if popup is not None:
+                    break
+                page.wait_for_timeout(100)
+            if popup is None:
+                raise ActualMerchantRegistrationError(
+                    "선택 돋보기를 실행했지만 실구매처 등록 창이 열리지 않았습니다."
+                )
+            popup.wait_for_url("**/account/real_store_mgt.jsp?**", timeout=10_000)
+            popup.bring_to_front()
             # The popup has exactly the two business inputs displayed to users:
             # 사업자번호 then 사업자명.  Ignore hidden/submit/reset inputs.
             inputs = popup.locator(
@@ -1289,23 +1463,73 @@ class EAccountingBrowserService:
             )
             if inputs.count() < 2:
                 raise ActualMerchantRegistrationError("실구매처 등록 팝업의 사업자번호·사업자명 입력란을 찾지 못했습니다.")
+            inputs.nth(0).wait_for(state="visible", timeout=10_000)
             inputs.nth(0).fill(business_number)
             inputs.nth(1).fill(merchant_name.strip())
+            self._prepared_actual_merchant_transaction_id = transaction.transaction_id
+            self._prepared_actual_merchant_popup_object = popup
+            prepared = True
+            return ActualMerchantPreparation(
+                message="실구매처 등록 창에 사업자번호와 사업자명을 자동 입력했습니다.",
+                row_number=row.row_number,
+                total_row_count=row.total_row_count,
+                grid_row_id=row.row_id,
+            )
+        finally:
+            if not prepared:
+                self._prepared_actual_merchant_transaction_id = None
+                self._prepared_actual_merchant_popup_object = None
+                if popup is not None and not popup.is_closed():
+                    popup.close()
 
-            dialog_messages: list[str] = []
+    def _prepared_actual_merchant_popup(self, transaction: UnsubmittedTransaction):
+        if self._prepared_actual_merchant_transaction_id != transaction.transaction_id:
+            raise ActualMerchantRegistrationError(
+                "현재 거래에 대해 자동 입력한 실구매처 등록 창이 아닙니다."
+            )
+        popup = self._prepared_actual_merchant_popup_object
+        if popup is None or popup.is_closed():
+            raise ActualMerchantRegistrationError(
+                "실구매처 등록 창이 닫혔습니다. 등록을 전송하지 않았습니다."
+            )
+        return popup
 
-            def accept_dialog(dialog) -> None:
-                dialog_messages.append(dialog.message)
+    @staticmethod
+    def _attach_accept_all_dialogs(popup, dialog_messages: list[str]) -> None:
+        def accept_dialog(dialog) -> None:
+            dialog_messages.append(dialog.message)
+            try:
                 dialog.accept()
+            except Exception:
+                pass
 
-            popup.on("dialog", accept_dialog)
+        popup.on("dialog", accept_dialog)
+
+    def _submit_prepared_actual_merchant_registration(
+        self,
+        context,
+        transaction: UnsubmittedTransaction,
+    ) -> str:
+        popup = self._prepared_actual_merchant_popup(transaction)
+        dialog_messages: list[str] = []
+        self._attach_accept_all_dialogs(popup, dialog_messages)
+        try:
             register_button = popup.get_by_text("등록", exact=True)
             if register_button.count() != 1:
+                register_button = popup.locator(
+                    "input[type='button'][value='등록'], input[type='submit'][value='등록'], button:has-text('등록')"
+                )
+            if register_button.count() != 1:
                 raise ActualMerchantRegistrationError("실구매처 등록 팝업의 '등록' 버튼을 하나로 찾지 못했습니다.")
-            register_button.evaluate("element => element.click()")
-            popup.wait_for_timeout(600)
-            # A registered popup normally closes itself or presents a success
-            # alert.  Do not claim success if neither signal is observable.
+            try:
+                register_button.evaluate("element => element.click()")
+                popup.wait_for_timeout(600)
+            except Exception as exc:
+                if popup.is_closed():
+                    return "실구매처 등록 창이 정상적으로 닫혔습니다."
+                raise ActualMerchantRegistrationError(
+                    f"실구매처 등록 동작을 완료하지 못했습니다: {exc}"
+                ) from exc
             if popup.is_closed():
                 return "실구매처 등록 창이 정상적으로 닫혔습니다."
             message = " / ".join(dialog_messages)
@@ -1315,8 +1539,44 @@ class EAccountingBrowserService:
                 raise ActualMerchantRegistrationError(f"실구매처 등록이 완료되지 않았습니다: {message}")
             raise ActualMerchantRegistrationError("실구매처 등록 완료 신호를 확인하지 못했습니다. e-Acc 화면을 확인해 주세요.")
         finally:
+            self._prepared_actual_merchant_transaction_id = None
+            self._prepared_actual_merchant_popup_object = None
             if popup is not None and not popup.is_closed():
                 popup.close()
+
+    def _reset_prepared_actual_merchant_registration(
+        self,
+        context,
+        transaction: UnsubmittedTransaction,
+    ) -> str:
+        popup = self._prepared_actual_merchant_popup(transaction)
+        dialog_messages: list[str] = []
+        self._attach_accept_all_dialogs(popup, dialog_messages)
+        try:
+            reset_button = popup.get_by_text("초기화", exact=True)
+            if reset_button.count() != 1:
+                reset_button = popup.locator(
+                    "input[type='button'][value='초기화'], input[type='reset'][value='초기화'], button:has-text('초기화')"
+                )
+            if reset_button.count() != 1:
+                raise ActualMerchantRegistrationError("실구매처 등록 팝업의 '초기화' 버튼을 하나로 찾지 못했습니다.")
+            try:
+                reset_button.evaluate("element => element.click()")
+                # 초기화 후 e-Acc가 1~2개의 확인 alert를 순차 표시할 수 있다.
+                # dialog handler가 모두 수락할 시간을 짧게 제공한다.
+                popup.wait_for_timeout(1_000)
+            except Exception as exc:
+                if not popup.is_closed():
+                    raise ActualMerchantRegistrationError(
+                        f"실구매처 입력 초기화를 완료하지 못했습니다: {exc}"
+                    ) from exc
+            return "실구매처 입력을 초기화하고 e-Acc 확인 팝업을 모두 처리했습니다."
+        finally:
+            self._prepared_actual_merchant_transaction_id = None
+            self._prepared_actual_merchant_popup_object = None
+            if popup is not None and not popup.is_closed():
+                popup.close()
+            self._clear_eaccounting_grid_selection(context)
 
     def _open_approval_line(
         self,
@@ -1673,18 +1933,24 @@ class EAccountingBrowserService:
         return "결재요청을 중지했습니다. 결재선 지정 창을 닫고 선택을 해제했습니다."
 
     @staticmethod
-    def _find_transaction_row_id(main_frame, transaction: UnsubmittedTransaction) -> str:
+    def _find_transaction_grid_row(
+        main_frame,
+        transaction: UnsubmittedTransaction,
+    ) -> _GridRowLocation:
         matches = main_frame.evaluate(
             r"""
             target => {
                 const digits = value => String(value ?? '').replace(/\D/g, '');
                 const amount = value => String(value ?? '').replace(/[^0-9-]/g, '');
-                return GridObj.getAllRowIds().split(',').filter(Boolean).filter(rowId =>
-                    String(GridObj.cells(rowId, GridObj.getColIndexById('CARD_NO')).getValue()) === target.cardNumber &&
-                    String(GridObj.cells(rowId, GridObj.getColIndexById('APPR_NO')).getValue()) === target.approvalNumber &&
-                    digits(GridObj.cells(rowId, GridObj.getColIndexById('BLDAT')).getValue()) === target.evidenceDate &&
-                    amount(GridObj.cells(rowId, GridObj.getColIndexById('USED_AMT')).getValue()) === target.amount
-                );
+                const rowIds = GridObj.getAllRowIds().split(',').filter(Boolean);
+                return rowIds.map((rowId, index) => ({rowId, rowNumber: index + 1}))
+                    .filter(row =>
+                        String(GridObj.cells(row.rowId, GridObj.getColIndexById('CARD_NO')).getValue()) === target.cardNumber &&
+                        String(GridObj.cells(row.rowId, GridObj.getColIndexById('APPR_NO')).getValue()) === target.approvalNumber &&
+                        digits(GridObj.cells(row.rowId, GridObj.getColIndexById('BLDAT')).getValue()) === target.evidenceDate &&
+                        amount(GridObj.cells(row.rowId, GridObj.getColIndexById('USED_AMT')).getValue()) === target.amount
+                    )
+                    .map(row => ({...row, totalRowCount: rowIds.length}));
             }
             """,
             {
@@ -1698,7 +1964,17 @@ class EAccountingBrowserService:
             raise ActualMerchantRegistrationError(
                 f"선택 거래와 일치하는 웹 화면 행이 {len(matches)}건입니다. 실구매처를 안전하게 등록할 수 없습니다."
             )
-        return str(matches[0])
+        match = matches[0]
+        return _GridRowLocation(
+            row_id=str(match["rowId"]),
+            row_number=int(match["rowNumber"]),
+            total_row_count=int(match["totalRowCount"]),
+        )
+
+    @classmethod
+    def _find_transaction_row_id(cls, main_frame, transaction: UnsubmittedTransaction) -> str:
+        """Compatibility helper for actions that only need the technical grid row ID."""
+        return cls._find_transaction_grid_row(main_frame, transaction).row_id
 
     @staticmethod
     def _hide_receipt_popup(popup, existing_windows: set[int]) -> None:

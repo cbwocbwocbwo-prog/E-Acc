@@ -97,7 +97,7 @@ class AccountValidationResult:
     """The account-specific rule outcome kept separate from OCR validation."""
 
     transaction_id: str
-    status: str  # 정상 / 예외 / 검증대기
+    status: str  # 정상 / 정상(i) / 예외 / 검증대기
     reasons: tuple[str, ...] = ()
     required_employee_count: int = 0
     matched_employee_names: tuple[str, ...] = ()
@@ -197,7 +197,31 @@ def validate_account_rules(
             return _result(transaction, "검증대기", ("영수증 OCR 검증 대기",))
         detected_categories = _detect_vehicle_categories(receipt_text)
         expected_name = expected_category
-        if detected_categories and detected_categories != (expected_name,):
+        # 전자영수증에는 실제 결제 유형과 무관하게 "주유/자동차주차요금"처럼
+        # 복수의 공통 분류어가 함께 찍히는 경우가 있다. 이때 목표 계정의
+        # 키워드가 OCR 본문에 있으면 해당 계정 영수증으로 인정하되, 혼합
+        # 키워드였다는 사실은 정상(i)로 구분해 결과 화면에 남긴다.
+        if expected_name in detected_categories:
+            if detected_categories == (expected_name,):
+                return _result(
+                    transaction,
+                    "정상",
+                    (
+                        f"{expected_name} 영수증 키워드 확인"
+                        f" ({', '.join(detected_categories)})",
+                    ),
+                    detected_receipt_categories=detected_categories,
+                )
+            return _result(
+                transaction,
+                "정상(i)",
+                (
+                    f"{expected_name} OCR 키워드 포함 확인"
+                    f" (함께 감지: {', '.join(detected_categories)})",
+                ),
+                detected_receipt_categories=detected_categories,
+            )
+        if detected_categories:
             return _result(
                 transaction,
                 "예외",
@@ -205,13 +229,7 @@ def validate_account_rules(
                 detected_receipt_categories=detected_categories,
             )
         # No recognizable comparison word is intentionally considered normal.
-        if detected_categories:
-            audit_reason = (
-                f"{expected_name} 영수증 키워드 확인"
-                f" ({', '.join(detected_categories)})"
-            )
-        else:
-            audit_reason = f"{expected_name}: 비교 키워드 미검출(정상 간주)"
+        audit_reason = f"{expected_name}: 비교 키워드 미검출(정상 간주)"
         return _result(
             transaction,
             "정상",

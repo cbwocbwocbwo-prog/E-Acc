@@ -161,6 +161,16 @@ class ReceiptValidationResult:
     orientation_ambiguous: bool = False
     orientation_reason: str = ""
 
+    @property
+    def is_approval_eligible(self) -> bool:
+        """Whether this receipt result is safe to continue to approval.
+
+        ``정상(2)`` means that the amount and either approval number or
+        evidence date match.  It is deliberately distinct in the UI, while
+        still being an approved OCR outcome for the automation flow.
+        """
+        return self.status in {"정상", "정상(2)"}
+
 
 @dataclass(frozen=True, slots=True)
 class MerchantLookupResult:

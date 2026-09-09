@@ -333,7 +333,7 @@
         <div class="val" id="kpi-exception">0</div><div class="cap">예외처리</div>
       </div>
       <div class="kpi-card clickable" style="--kpi-color:var(--warning)" onclick="filterResult('pg_pending')">
-        <div class="val" id="kpi-pgwait">0</div><div class="cap">PG 등록 대기</div>
+        <div class="val" id="kpi-pgwait">0</div><div class="cap">PG 등록</div>
       </div>
       <div class="stage-box">
         <div class="cap">현재 단계</div>
@@ -343,8 +343,7 @@
     </div>
 
     <div class="toolbar-row">
-      <span class="note">정상 일반 행은 검증 후 결재요청까지 자동 진행합니다.</span>
-      <button class="btn btn-ghost" onclick="callApi('register_merchant')">PG 실구매처 등록</button>
+      <span class="note">정상 행은 검증 후 결재요청까지 자동 진행합니다. PG일반은 입력값 확인 후 자동으로 이어집니다.</span>
     </div>
 
     <div class="tabs" id="tabBar"></div>
@@ -513,8 +512,8 @@ const CENTER_COLS = new Set(["행","가져오기상태","영수증판정","계�
 
 let tableData = { transactions: [], results: [], mail: [], processing: [], export: [] };
 let selectedRowByTab = {};
-let resultFilter = null; // "처리 완료" | "예외처리" | "PG 등록 대기" | null
-const FILTER_TEXT = { completed: "처리 완료", exception: "예외처리", pg_pending: "PG 등록 대기" };
+let resultFilter = null; // "completed" | "exception" | "pg_pending" | null
+const FILTER_TEXT = { completed: "처리 완료", exception: "예외처리", pg_pending: "PG 등록" };
 
 function badgeClassFor(tabId, tags, text) {
   const def = TAB_DEFS[tabId];
@@ -581,9 +580,20 @@ function clearFilter() {
 }
 
 function filterResult(kind) {
-  resultFilter = FILTER_TEXT[kind];
+  resultFilter = kind;
   switchTab("results");
   renderTable("results");
+}
+
+function matchesResultFilter(row, def) {
+  if (!resultFilter) return true;
+  if (resultFilter === "pg_pending") {
+    // PG 등록은 최종 결과가 아니라, PG 처리 자체가 필요한 모든 행이다.
+    const pgIndex = def.columns.indexOf("PG 처리");
+    return pgIndex >= 0 && String(row.values[pgIndex]) !== "대상 아님";
+  }
+  const finalIndex = def.columns.indexOf("최종 결과");
+  return finalIndex >= 0 && String(row.values[finalIndex]) === FILTER_TEXT[resultFilter];
 }
 
 function renderTable(tabId) {
@@ -593,9 +603,9 @@ function renderTable(tabId) {
 
   let banner = "";
   if (tabId === "results" && resultFilter) {
-    const visibleCount = rows.filter(r => String(r.values[def.columns.indexOf(def.badgeCol)]) === resultFilter).length;
-    banner = `<div class="filter-banner">필터: ${resultFilter} (${visibleCount}건) <button onclick="clearFilter()">해제</button></div>`;
-    rows = rows.filter(r => String(r.values[def.columns.indexOf(def.badgeCol)]) === resultFilter);
+    const visibleCount = rows.filter(r => matchesResultFilter(r, def)).length;
+    banner = `<div class="filter-banner">필터: ${FILTER_TEXT[resultFilter]} (${visibleCount}건) <button onclick="clearFilter()">해제</button></div>`;
+    rows = rows.filter(r => matchesResultFilter(r, def));
   }
 
   const thead = "<thead><tr>" + def.columns.map(c => `<th>${c}</th>`).join("") + "</tr></thead>";
@@ -638,7 +648,7 @@ function updateState(state) {
   document.getElementById('kpi-target').textContent = state.kpi['처리대상'] ?? '0';
   document.getElementById('kpi-completed').textContent = state.kpi['처리 완료'] ?? '0';
   document.getElementById('kpi-exception').textContent = state.kpi['예외처리'] ?? '0';
-  document.getElementById('kpi-pgwait').textContent = state.kpi['PG 등록 대기'] ?? '0';
+  document.getElementById('kpi-pgwait').textContent = state.kpi['PG 등록'] ?? '0';
   document.getElementById('targetText').textContent = state.currentTarget || "";
   document.getElementById('stageText').textContent = state.currentStage || "";
   document.getElementById('statusText').textContent = state.statusMessage || "";

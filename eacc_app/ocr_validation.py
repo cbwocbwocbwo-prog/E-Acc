@@ -446,6 +446,23 @@ def _amount_check(transaction: UnsubmittedTransaction, tokens: tuple[str, ...]) 
     return direct
 
 
+def receipt_validation_status(checks: tuple[ReceiptFieldCheck, ...]) -> str:
+    """Classify the three mandatory receipt fields without hiding a two-field pass.
+
+    The amount must always match.  A receipt is accepted as ``정상(2)`` only
+    when that amount is accompanied by the matching approval number *or* the
+    matching evidence date.  Approval number plus date alone never passes.
+    """
+    matched_fields = {check.field_name for check in checks if check.is_match}
+    if {"승인번호", "증빙일자", "사용금액"} <= matched_fields:
+        return "정상"
+    if "사용금액" in matched_fields and (
+        "승인번호" in matched_fields or "증빙일자" in matched_fields
+    ):
+        return "정상(2)"
+    return "이상"
+
+
 def evaluate_ocr_text(
     transaction: UnsubmittedTransaction,
     text: str,
@@ -458,7 +475,7 @@ def evaluate_ocr_text(
     )
     return ReceiptValidationResult(
         transaction_id=transaction.transaction_id,
-        status="정상" if all(check.is_match for check in checks) else "이상",
+        status=receipt_validation_status(checks),
         checks=checks,
         ocr_text=text,
     )

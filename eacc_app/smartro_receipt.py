@@ -118,7 +118,7 @@ def merge_smartro_approval_result(
     )
     return replace(
         validation,
-        status="정상" if all(check.is_match for check in checks) else "이상",
+        status=ocr_validation.receipt_validation_status(checks),
         checks=checks,
         ocr_text=merged_text,
     )

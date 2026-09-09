@@ -15,10 +15,12 @@ from PIL import Image, ImageTk
 
 from .account_validation import AccountValidationResult, validate_account_rules
 from .browser_automation import (
+    ActualMerchantPreparation,
     ActualMerchantRegistrationError,
     ApprovalInProgressError,
     BrowserAutomationError,
     BrowserLoginRequired,
+    CurrentEAccTarget,
     EAccountingBrowserService,
     LoginCredentials,
     NoEligibleTransactions,
@@ -84,6 +86,31 @@ APPROVAL_RESULT_STATUSES = frozenset(
         "예외처리",
     }
 )
+
+# 새 UI는 Windows에 설치된 Edge/WebView2 버전에 의존하지 않는다. 이 고정
+# 런타임 폴더 전체를 배포물에 포함하고, 개발 PC도 정확히 같은 파일을 사용한다.
+WEBVIEW2_FIXED_RUNTIME_VERSION = "152.0.4191.62"
+WEBVIEW2_FIXED_RUNTIME_DIRECTORY = (
+    Path("runtime")
+    / "webview2_fixed_x64"
+    / f"Microsoft.WebView2.FixedVersionRuntime.{WEBVIEW2_FIXED_RUNTIME_VERSION}.x64"
+)
+
+
+def _configure_fixed_webview2_runtime() -> Path:
+    """Force pywebview to use the Fixed Version Runtime shipped with this app."""
+    application_root = Path(__file__).resolve().parents[1]
+    runtime_directory = application_root / WEBVIEW2_FIXED_RUNTIME_DIRECTORY
+    runtime_executable = runtime_directory / "msedgewebview2.exe"
+    if not runtime_executable.is_file():
+        raise RuntimeError(
+            "배포 구성 오류: 포함된 WebView2 고정 런타임을 찾지 못했습니다. "
+            f"필수 파일: {runtime_executable}"
+        )
+    # This setting is consumed by pywebview before it creates the native
+    # WebView2 environment. It bypasses the machine-wide Evergreen runtime.
+    webview.settings["WEBVIEW2_RUNTIME_PATH"] = str(runtime_directory)
+    return runtime_directory
 
 
 def default_database_path() -> Path:
@@ -163,6 +190,9 @@ class EAccApplication(tb.Window):
         )
         self._current_target: UnsubmittedTransaction | None = None
         self._current_target_row: ImportDisplayRow | None = None
+        self._current_eacc_row_number = 0
+        self._current_eacc_total_rows = 0
+        self._current_eacc_grid_row_id = ""
         self._pending_approval_transactions: dict[str, UnsubmittedTransaction] = {}
         self._processing_result_filter: str | None = None
         self._processing_filter_navigation = False
@@ -225,7 +255,7 @@ class EAccApplication(tb.Window):
 
         # 대시보드 KPI 카드: 예전에는 배경 없이 숫자만 놓여 있었는데, 상태별로
         # 옅은 색 배경을 깐 카드로 바꿔서 한눈에 어디를 봐야 하는지 보이게 한다.
-        # ("처리 완료"=초록, "예외처리"=빨강, "PG 등록 대기"=주황, 그 외=중립)
+        # ("처리 완료"=초록, "예외처리"=빨강, "PG 등록"=주황, 그 외=중립)
         card_tones = {
             "Neutral": (PALETTE["accent"], "#FFFFFF"),
             "Success": (PALETTE["success_fg"], PALETTE["success_bg"]),
@@ -371,7 +401,7 @@ class EAccApplication(tb.Window):
             "처리대상": tk.StringVar(value="0"),
             "처리 완료": tk.StringVar(value="0"),
             "예외처리": tk.StringVar(value="0"),
-            "PG 등록 대기": tk.StringVar(value="0"),
+            "PG 등록": tk.StringVar(value="0"),
         }
         # 카드마다 상태에 맞는 색을 입혀서(초록=완료, 빨강=예외처리, 주황=PG 대기)
         # 숫자만 나열되어 있던 예전보다 한눈에 어디를 봐야 하는지 알 수 있게 한다.
@@ -379,7 +409,7 @@ class EAccApplication(tb.Window):
             "처리대상": "Neutral",
             "처리 완료": "Success",
             "예외처리": "Danger",
-            "PG 등록 대기": "Warning",
+            "PG 등록": "Warning",
         }
         for index, (caption, variable) in enumerate(self.session_vars.items()):
             tone = card_tones[caption]
@@ -389,7 +419,7 @@ class EAccApplication(tb.Window):
             result_filter = {
                 "처리 완료": "completed",
                 "예외처리": "exception",
-                "PG 등록 대기": "pg_pending",
+                "PG 등록": "pg_pending",
             }.get(caption)
             caption_label = ttk.Label(
                 card,
@@ -432,15 +462,9 @@ class EAccApplication(tb.Window):
         toolbar.pack(fill="x", pady=(0, 8))
         ttk.Label(
             toolbar,
-            text="정상 일반 행은 검증 후 결재요청까지 자동 진행합니다.",
+            text="정상 행은 검증 후 결재요청까지 자동 진행합니다. PG일반은 입력값 확인 후 자동으로 이어집니다.",
             style="Subtitle.TLabel",
         ).pack(side="left")
-        self.actual_merchant_register_button = ttk.Button(
-            toolbar,
-            text="PG 실구매처 등록",
-            command=self._register_selected_actual_merchant,
-        )
-        self.actual_merchant_register_button.pack(side="right")
 
         self.progress = ttk.Progressbar(content, mode="indeterminate")
         self.progress.pack(fill="x", pady=(0, 8))
@@ -700,9 +724,13 @@ class EAccApplication(tb.Window):
             excluded_transaction_ids=frozenset(self._excluded_transaction_ids),
         )
 
-    def _on_current_first_target(self, transaction: UnsubmittedTransaction) -> None:
+    def _on_current_first_target(self, current: CurrentEAccTarget) -> None:
         self._set_busy(False)
+        transaction = current.transaction
         self._current_target = transaction
+        self._current_eacc_row_number = current.row_number
+        self._current_eacc_total_rows = current.total_row_count
+        self._current_eacc_grid_row_id = current.grid_row_id
         self._session_target_ids.add(transaction.transaction_id)
         self._refresh_session_dashboard()
         # 한 건씩 처리 흐름에서는 이전에 내려받은 전체 Excel 목록이 현재 화면의
@@ -715,21 +743,19 @@ class EAccApplication(tb.Window):
         display_values = transaction.display_values()
         raw_values = tuple((*display_values[:19], "", *display_values[19:]))
         self._current_target_row = ImportDisplayRow(
-            source_row_number=1,
+            source_row_number=current.row_number,
             status="현재",
             transaction=transaction,
             raw_values=raw_values,
         )
         self._evaluate_account_rules(transaction, None)
-        self.current_target_message.set(
-            "현재 처리대상: "
-            f"승인번호 {transaction.approval_number} / 증빙일자 {transaction.evidence_date} / "
-            f"금액 {transaction.amount:,.0f} / 계정명 {transaction.account_name} / 업종 {transaction.business_type}"
+        self._set_current_eacc_target_message(
+            transaction, current.row_number, current.total_row_count
         )
         self._record_processing_event(
             transaction,
             "현재 처리대상 읽음",
-            "e-Acc 코스트센터 검색 결과의 현재 첫 행을 직접 읽었습니다.",
+            f"e-Acc 코스트센터 검색 결과의 {current.row_number}번째 행 / 총 {current.total_row_count}건을 직접 읽었습니다.",
         )
         self._apply_filter()
         items = self.transactions_tree.get_children()
@@ -738,6 +764,29 @@ class EAccApplication(tb.Window):
             self.transactions_tree.focus(items[0])
         self.status_message.set("현재 첫 처리대상을 읽었습니다. 영수증 검증을 시작합니다...")
         self.after(50, self._validate_current_target_automatically, transaction)
+
+    def _set_current_eacc_target_message(
+        self,
+        transaction: UnsubmittedTransaction,
+        row_number: int,
+        total_row_count: int,
+    ) -> None:
+        """Keep the UI aligned with the exact row currently found in e-Acc."""
+        self._current_eacc_row_number = row_number
+        self._current_eacc_total_rows = total_row_count
+        self.current_target_message.set(
+            f"현재 e-Acc 처리대상: {row_number}번째 행 / 전체 {total_row_count}건 | "
+            f"승인번호 {transaction.approval_number} / 증빙일자 {transaction.evidence_date} / "
+            f"금액 {transaction.amount:,.0f} / 계정명 {transaction.account_name} / 업종 {transaction.business_type}"
+        )
+        if (
+            self._current_target_row is not None
+            and self._current_target_row.transaction is not None
+            and self._current_target_row.transaction.transaction_id == transaction.transaction_id
+        ):
+            self._current_target_row = replace(
+                self._current_target_row, source_row_number=row_number
+            )
 
     def _on_current_target_error(self, error: Exception) -> None:
         self._set_busy(False)
@@ -923,7 +972,7 @@ class EAccApplication(tb.Window):
         elif status == "예외처리":
             self._session_exception_ids.add(transaction.transaction_id)
             self._session_pg_waiting_ids.discard(transaction.transaction_id)
-        elif status == "PG 등록 대기":
+        elif status == "PG 등록":
             self._session_pg_waiting_ids.add(transaction.transaction_id)
         elif status == "실구매처 등록 완료":
             self._session_pg_waiting_ids.discard(transaction.transaction_id)
@@ -949,7 +998,7 @@ class EAccApplication(tb.Window):
         self.session_vars["처리대상"].set(f"{len(self._session_target_ids):,}")
         self.session_vars["처리 완료"].set(f"{len(self._session_completed_ids):,}")
         self.session_vars["예외처리"].set(f"{len(self._session_exception_ids):,}")
-        self.session_vars["PG 등록 대기"].set(f"{len(self._session_pg_waiting_ids):,}")
+        self.session_vars["PG 등록"].set(f"{len(self._session_pg_waiting_ids):,}")
 
     def _refresh_after_eacc_approval(
         self,
@@ -996,7 +1045,7 @@ class EAccApplication(tb.Window):
         validation = self._receipt_results.get(transaction.transaction_id)
         if validation is None:
             return "현재 행의 영수증 OCR 검증 결과가 없습니다. 먼저 영수증 검증을 완료해 주세요."
-        if validation.status != "정상":
+        if not validation.is_approval_eligible:
             return "영수증 OCR 판정이 정상 상태가 아니므로 결재요청할 수 없습니다."
         if is_pg_business_type(transaction.business_type) and not transaction.actual_merchant_name.strip():
             merchant = self._merchant_results.get(transaction.transaction_id)
@@ -1236,22 +1285,19 @@ class EAccApplication(tb.Window):
             "PG 상호조회 완료",
             f"사업자번호 {business_number} / 비즈노 상호 {merchant_name}",
         )
-        self._record_processing_event(
+        self._pending_merchant_transaction = transaction
+        self._set_busy(True, "PG 실구매처 등록 창을 열고 조회 결과를 자동 입력하는 중입니다...")
+        self.browser_service.prepare_actual_merchant_registration(
             transaction,
-            "PG 등록 대기",
-            "비즈노 상호조회가 완료되었습니다. e-Acc 실구매처 등록 후 자동 결재를 재개합니다.",
-        )
-        self._apply_filter()
-        self.status_message.set(
-            f"PG 상호 조회 완료: 사업자번호 {business_number} / 비즈노 상호 {merchant_name}"
-        )
-        messagebox.showinfo(
-            "PG 실구매처 등록 필요",
-            "현재 행은 PG일반 대상입니다.\n\n"
-            "e-Acc에서 현재 행의 '선택' 돋보기를 더블클릭해 실구매처 등록 창을 연 뒤,\n"
-            "프로그램의 'PG 실구매처 등록' 버튼을 눌러 주세요.\n\n"
-            "등록이 성공하면 이 행의 결재요청과 다음 행 자동 처리가 이어집니다.",
-            parent=self,
+            business_number,
+            merchant_name,
+            self._consume_login_credentials(),
+            on_success=lambda preparation: self.after(
+                0, self._on_actual_merchant_prepared, transaction, preparation
+            ),
+            on_error=lambda exc: self.after(
+                0, self._on_actual_merchant_registration_error, transaction, exc
+            ),
         )
 
     def _on_pg_merchant_error(self, error: Exception) -> None:
@@ -1269,44 +1315,80 @@ class EAccApplication(tb.Window):
             self._apply_filter()
         self.status_message.set(f"PG 상호 조회 확인 필요: {error}")
 
-    def _register_selected_actual_merchant(self) -> None:
-        transaction = self._selected_transaction("실구매처 등록")
-        if transaction is None:
-            return
+    def _on_actual_merchant_prepared(
+        self,
+        transaction: UnsubmittedTransaction,
+        preparation: ActualMerchantPreparation,
+    ) -> None:
+        self._set_busy(False)
+        self._pending_merchant_transaction = None
+        self._set_current_eacc_target_message(
+            transaction, preparation.row_number, preparation.total_row_count
+        )
+        self._current_eacc_grid_row_id = preparation.grid_row_id
         result = self._merchant_results.get(transaction.transaction_id)
-        if result is None or result.status != "조회완료":
-            messagebox.showinfo(
-                "상호 조회 필요",
-                "먼저 '현재 첫 처리대상 읽기'를 실행해 PG 상호 자동조회를 완료해 주세요.",
-                parent=self,
+        if result is None:
+            self._on_actual_merchant_registration_error(
+                transaction, RuntimeError("PG 상호조회 결과를 다시 찾지 못했습니다.")
             )
             return
-        if transaction.actual_merchant_name.strip():
-            messagebox.showinfo(
-                "등록 대상 아님",
-                f"이미 실구매처명 '{transaction.actual_merchant_name}'이 등록된 행입니다.",
-                parent=self,
-            )
-            return
+        self._record_processing_event(
+            transaction,
+            "PG 등록",
+            f"{preparation.message} e-Acc {preparation.row_number}번째 행 / 전체 {preparation.total_row_count}건 / "
+            f"사업자번호 {result.business_number} / 사업자명 {result.merchant_name}",
+        )
+        self._apply_filter()
+        self.status_message.set("PG 입력값 확인을 기다리는 중입니다.")
         confirm = messagebox.askyesno(
-            "실구매처 등록 확인",
-            "아래 값을 e-Accounting에 등록합니다.\n\n"
+            "PG 입력 확인",
+            "e-Acc 실구매처 등록 창에 아래 값을 자동 입력했습니다.\n\n"
             f"사업자번호: {result.business_number}\n"
             f"사업자명: {result.merchant_name}\n\n"
-            "등록할까요?",
+            "입력 내용이 맞습니까?",
             parent=self,
         )
-        if not confirm:
+        if confirm:
+            self._set_busy(True, "확인한 PG 입력값을 e-Acc에 등록하는 중입니다...")
+            self.browser_service.submit_prepared_actual_merchant_registration(
+                transaction,
+                on_success=lambda registered: self.after(
+                    0, self._on_actual_merchant_registered, transaction, registered
+                ),
+                on_error=lambda exc: self.after(
+                    0, self._on_actual_merchant_registration_error, transaction, exc
+                ),
+            )
             return
-        self._set_busy(True, "e-Accounting 실구매처 등록 팝업에 조회 결과를 등록하는 중입니다...")
-        self.browser_service.register_actual_merchant(
+        self._set_busy(True, "PG 입력을 초기화하고 e-Acc 확인 팝업을 정리하는 중입니다...")
+        self.browser_service.reset_prepared_actual_merchant_registration(
             transaction,
-            result.business_number,
-            result.merchant_name,
-            self._consume_login_credentials(),
-            on_success=lambda message: self.after(0, self._on_actual_merchant_registered, transaction, message),
-            on_error=lambda exc: self.after(0, self._on_actual_merchant_registration_error, transaction, exc),
+            on_success=lambda reset: self.after(
+                0, self._on_actual_merchant_reset, transaction, reset
+            ),
+            on_error=lambda exc: self.after(
+                0, self._on_actual_merchant_registration_error, transaction, exc
+            ),
         )
+
+    def _on_actual_merchant_reset(
+        self,
+        transaction: UnsubmittedTransaction,
+        message: str,
+    ) -> None:
+        self._set_busy(False)
+        result = self._merchant_results.get(transaction.transaction_id)
+        if result is not None:
+            self._merchant_results[transaction.transaction_id] = replace(
+                result,
+                registration_status="입력 확인 거부",
+                registration_reason=message,
+            )
+        reason = "PG 입력 확인 거부: " + message
+        self._record_processing_event(transaction, "예외처리", reason)
+        self._apply_filter()
+        self.status_message.set("예외처리: PG 입력 확인을 거부해 다음 행을 처리합니다.")
+        self._continue_after_exception(transaction)
 
     def _on_actual_merchant_registered(
         self,
@@ -1314,6 +1396,7 @@ class EAccApplication(tb.Window):
         message: str,
     ) -> None:
         self._set_busy(False)
+        self._pending_merchant_transaction = None
         result = self._merchant_results.get(transaction.transaction_id)
         if result is not None:
             self._merchant_results[transaction.transaction_id] = replace(
@@ -1332,6 +1415,7 @@ class EAccApplication(tb.Window):
         error: Exception,
     ) -> None:
         self._set_busy(False)
+        self._pending_merchant_transaction = None
         result = self._merchant_results.get(transaction.transaction_id)
         if result is not None:
             self._merchant_results[transaction.transaction_id] = replace(
@@ -1413,12 +1497,14 @@ class EAccApplication(tb.Window):
             if account_result is not None and account_result.status == "예외":
                 self.status_message.set(f"계정별 예외처리: {account_result.reason_text}")
                 self._continue_after_exception(transaction)
-            elif validation.status == "정상" and transaction is not None and is_pg_business_type(transaction.business_type):
+            elif validation.is_approval_eligible and transaction is not None and is_pg_business_type(transaction.business_type):
                 self._start_pg_lookup_from_validation(transaction, validation)
-            elif validation.status == "정상" and transaction is not None:
-                self.status_message.set("영수증·계정 검증 정상: 결재요청을 자동 진행합니다...")
+            elif validation.is_approval_eligible and transaction is not None:
+                self.status_message.set(
+                    f"영수증·계정 검증 {validation.status}: 결재요청을 자동 진행합니다..."
+                )
                 self.after(300, lambda: self._start_approval_request(transaction, automatic=True))
-            elif validation.status != "정상" and transaction is not None:
+            elif not validation.is_approval_eligible and transaction is not None:
                 mismatch_reasons = " / ".join(
                     check.reason for check in validation.checks if not check.is_match
                 )
@@ -1939,7 +2025,6 @@ class EAccApplication(tb.Window):
 
     def _set_busy(self, busy: bool, message: str = "") -> None:
         state = "disabled" if busy else "normal"
-        self.actual_merchant_register_button.configure(state=state)
         self.current_target_button.configure(state=state)
         self.unsubmitted_menu_button.configure(state=state)
         self.unprocessed_mail_button.configure(state=state)
@@ -2228,9 +2313,12 @@ class EAccApplication(tb.Window):
                 }[approval_event.status]
             final_status = (
                 latest.status
-                if latest.status in {"처리 완료", "예외처리", "PG 등록 대기"}
+                if latest.status in {"처리 완료", "예외처리", "PG 등록", "PG 등록 대기"}
                 else "처리중" if approval_event is not None else "처리대상"
             )
+            # 이전 실행 이력의 기존 표기는 화면에서도 새 상태명으로 통일한다.
+            if final_status == "PG 등록 대기":
+                final_status = "PG 등록"
             if (
                 self._processing_result_filter == "completed"
                 and final_status != "처리 완료"
@@ -2253,7 +2341,7 @@ class EAccApplication(tb.Window):
             )
             result_tag = {
                 "예외처리": "결과-예외처리",
-                "PG 등록 대기": "결과-PG등록대기",
+                "PG 등록": "결과-PG등록대기",
                 "처리대상": "결과-처리대상",
                 "처리중": "결과-처리대상",
             }.get(final_status, "")
@@ -2345,7 +2433,7 @@ class EAccApplication(tb.Window):
             tree.column(column, width=widths[column], anchor="center" if column == "구분" else "w")
         criteria = (
             ("공통 영수증", "증빙유무 #", "승인번호·증빙일자·사용금액을 영수증 OCR 값과 비교", "영수증 OCR 불일치"),
-            ("PG 처리", "업종에 PG일반 포함", "사업자번호 OCR → 비즈노 상호조회 → 실구매처 등록", "PG 조회·등록 확인 필요"),
+            ("PG 처리", "업종에 PG일반 포함", "사업자번호 OCR → 비즈노 상호조회 → 실구매처 자동입력 → 사용자 확인", "PG 입력 확인 거부 / 조회·등록 확인 필요"),
             ("계정별", "특근자식비", "15,000원당 인정 직원 최소 1명 확인", "특근자식비 사용인원 불충족"),
             ("계정별", "차량유지비-유류대·주차비·세차비·통행료", "영수증 키워드와 계정 유형을 비교", "계정과 상이한 영수증 첨부"),
             ("계정별", "일반복리비-현장지원 (현장대리인 활동지원 식음료대)", "20만원 초과, 주류 문구, 적요 작성 여부 확인", "사용금액 초과 / 주류 포함 / 불필요한 적요 작성"),
@@ -2439,9 +2527,6 @@ class EAccWebApi:
     def start_processing(self) -> None:
         self._app.after(0, self._app._read_current_first_target)
 
-    def register_merchant(self) -> None:
-        self._app.after(0, self._app._register_selected_actual_merchant)
-
     def show_guide(self) -> None:
         # 이 창은 이제 웹뷰(HTML/JS)에서 모달로 표시한다. 예전 tkinter
         # Toplevel 방식은 pywebview 창 뒤에 숨어서 "안 뜨는 것처럼"
@@ -2457,7 +2542,7 @@ class EAccWebApi:
             "columns": ["구분", "대상 계정·업종", "검증 기준", "예외처리 사유"],
             "rows": [
                 ["공통 영수증", "증빙유무 #", "승인번호·증빙일자·사용금액을 영수증 OCR 값과 비교", "영수증 OCR 불일치"],
-                ["PG 처리", "업종에 PG일반 포함", "사업자번호 OCR → 비즈노 상호조회 → 실구매처 등록", "PG 조회·등록 확인 필요"],
+                ["PG 처리", "업종에 PG일반 포함", "사업자번호 OCR → 비즈노 상호조회 → 실구매처 자동입력 → 사용자 확인", "PG 입력 확인 거부 / 조회·등록 확인 필요"],
                 ["계정별", "특근자식비", "15,000원당 인정 직원 최소 1명 확인", "특근자식비 사용인원 불충족"],
                 ["계정별", "차량유지비-유류대·주차비·세차비·통행료", "영수증 키워드와 계정 유형을 비교", "계정과 상이한 영수증 첨부"],
                 ["계정별", "일반복리비-현장지원 (현장대리인 활동지원 식음료대)", "20만원 초과, 주류 문구, 적요 작성 여부 확인", "사용금액 초과 / 주류 포함 / 불필요한 적요 작성"],
@@ -2488,6 +2573,7 @@ def run(initial_file: str | None = None) -> None:
     # 별도 스레드로 돌려서 "different apartment" 오류가 났다. 이번엔 생성과
     # mainloop를 같은 백그라운드 스레드에 묶고, pywebview(웹 창)는 원래대로
     # 메인 스레드에서 돌린다.
+    _configure_fixed_webview2_runtime()
     app_holder: dict[str, EAccApplication] = {}
     app_ready = threading.Event()
 
@@ -2532,4 +2618,3 @@ def run(initial_file: str | None = None) -> None:
     # 우클릭 → 검사(Inspect)로 개발자 도구가 필요할 때만 켤 수 있게
     # debug=False로 되돌린다 (True로 두면 DevTools 창이 매번 따로 떴다).
     webview.start(debug=False)
-

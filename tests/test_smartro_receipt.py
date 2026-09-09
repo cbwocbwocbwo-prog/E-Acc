@@ -37,13 +37,13 @@ def _transaction() -> UnsubmittedTransaction:
 
 
 class SmartroReceiptTests(unittest.TestCase):
-    def test_focused_approval_match_completes_otherwise_normal_result(self) -> None:
+    def test_focused_approval_match_completes_two_field_normal_result(self) -> None:
         transaction = _transaction()
         base = evaluate_ocr_text(
             transaction,
             "거래일시 2026/09/02 17:48:35 합계 7,115원 사업자번호 105-87-79517",
         )
-        self.assertEqual("이상", base.status)
+        self.assertEqual("정상(2)", base.status)
         result = merge_smartro_approval_result(transaction, base, "승인번호 15007711")
         self.assertEqual("정상", result.status)
         self.assertTrue(result.checks[0].is_match)
@@ -53,5 +53,6 @@ class SmartroReceiptTests(unittest.TestCase):
         transaction = _transaction()
         base = evaluate_ocr_text(transaction, "거래일시 2026/09/02 합계 7,115원")
         result = merge_smartro_approval_result(transaction, base, "승인번호 99999999")
-        self.assertEqual("이상", result.status)
+        self.assertEqual("정상(2)", result.status)
         self.assertFalse(result.checks[0].is_match)
+        self.assertTrue(result.is_approval_eligible)
