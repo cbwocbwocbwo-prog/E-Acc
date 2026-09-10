@@ -23,14 +23,18 @@ MAIL_SUBJECT = "[법인카드] 미등록 사용내역 등록 요청"
 LOCAL_SENDER_SETTINGS_FILENAME = "mail_sender.json"
 OL_FOLDER_DRAFTS = 16
 
-# Per-message pacing (seconds) between consecutive Send calls.  A small delay
-# lets Exchange finish processing the previous message and avoids the
-# throttling that otherwise freezes Outlook (and the calling app's UI thread)
-# on bulk-send runs of tens of messages.  0.3s was too tight - Exchange
-# needs ~0.5-0.8s per message, so 0.3s spacing let the queue back up and
-# Outlook still froze briefly.  1.0s gives Exchange enough breathing room
-# on Exchange-hosted profiles at the cost of ~30s extra on a 70-recipient run.
-BULK_SEND_PACING_SECONDS = 1.0
+# Per-message pacing (seconds) between consecutive Send calls.  Now that
+# bulk sends queue into the Outbox instead of calling ``Send`` synchronously
+# (see below), Outlook no longer blocks the calling thread on Exchange, so
+# a small 0.15s spacing is enough to keep the COM automation responsive
+# without artificially slowing down the queue-up phase.
+BULK_SEND_PACING_SECONDS = 0.15
+
+# Outlook's ``Outbox`` default-folder constant (olFolderOutbox in the
+# Outlook object model).  Moving a saved draft into this folder is how the
+# bulk-send path enqueues messages without triggering the synchronous
+# Exchange handshake that ``MailItem.Send`` runs.
+OL_FOLDER_OUTBOX = 4
 
 
 @dataclass(frozen=True, slots=True)
@@ -238,15 +242,37 @@ def send_via_outlook(
                 "Outlook에서 해당 계정의 '보낸 사람으로 사용' 권한 또는 "
                 "기본 데이터 파일(파일 → 계정 설정 → 데이터 파일)을 확인해 주세요."
             )
-    mail.Send()
-    # Record when the Send() call returned so the next bulk-send iteration
-    # can pace itself relative to it.  Only meaningful when the caller
-    # reuses this context; one-off sends drop it on the floor immediately.
+    # 예전엔 ``mail.Send()``를 바로 호출했다.  Send()는 동기 호출이라
+    # Exchange 서버 왕복이 끝날 때까지 Outlook COM 스레드를 붙잡고 있어서,
+    # 70명 발송 시 Outlook과 PC가 몇 분씩 얼어붙는 원인이 됐다.
+    #
+    # 대신 초안(mail)을 요청 계정의 Outbox 폴더로 이동시켜 큐잉만 한다.
+    # 그 다음부턴 Outlook이 자기 페이스로 백그라운드 발송을 하고,
+    # 우리 프로그램은 폴링으로 '보낸 편지함' 이동을 감지해 로그를 갱신한다.
+    #
+    # 참고: MoveTo는 로컬 스토어 조작이라 서버 왕복이 없다.  Save 직후
+    #       바로 호출해도 안전하다.
+    queued = False
+    try:
+        if send_account is not None:
+            outbox = send_account.DeliveryStore.GetDefaultFolder(OL_FOLDER_OUTBOX)
+        else:
+            outbox = outlook.GetNamespace("MAPI").GetDefaultFolder(OL_FOLDER_OUTBOX)
+        if outbox is not None:
+            mail.Move(outbox)
+            queued = True
+    except Exception:
+        # 이 프로필에서 Outbox 이동이 실패하면(예: POP3 즉시발송 계정)
+        # 옛날 방식으로 폴백한다.  이 경로는 Outlook을 잠깐 붙잡을 수
+        # 있지만 최소한 메일은 나간다.
+        queued = False
+    if not queued:
+        mail.Send()
+
     if not owns_context:
         context.last_send_at = time.monotonic()
-    # ``Send`` queues the item in Outlook; it is not evidence that mail has
-    # already left the Outbox.  Record the truthful immediate state first.
-    # A later folder reconciliation can promote this to ``발송 완료``.
+    # Outbox에 큐잉된 상태이므로 '발송 대기'가 정확한 즉시 상태다.
+    # 이후 폴링이 '발송 완료'로 승격한다.
     return "발송 대기", message_id
 
 
