@@ -26,9 +26,11 @@ OL_FOLDER_DRAFTS = 16
 # Per-message pacing (seconds) between consecutive Send calls.  A small delay
 # lets Exchange finish processing the previous message and avoids the
 # throttling that otherwise freezes Outlook (and the calling app's UI thread)
-# on bulk-send runs of tens of messages.  Empirically 0.3s is a good trade
-# between throughput and reliability on Exchange-hosted profiles.
-BULK_SEND_PACING_SECONDS = 0.3
+# on bulk-send runs of tens of messages.  0.3s was too tight - Exchange
+# needs ~0.5-0.8s per message, so 0.3s spacing let the queue back up and
+# Outlook still froze briefly.  1.0s gives Exchange enough breathing room
+# on Exchange-hosted profiles at the cost of ~30s extra on a 70-recipient run.
+BULK_SEND_PACING_SECONDS = 1.0
 
 
 @dataclass(frozen=True, slots=True)

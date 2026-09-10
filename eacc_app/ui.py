@@ -1989,12 +1989,46 @@ class EAccApplication(tb.Window):
         self._refresh_mail_log()
         self._set_busy(False)
         self.status_message.set("Outlook 발송 결과를 메일 Log에 기록했습니다.")
-        # The first log entry is intentionally '발송 대기'.  Reconcile once
-        # after Outlook has had a moment to move the message into Sent Items.
-        self.after(3000, self._refresh_outlook_delivery_status)
+        # 상태 확인 폴링: Exchange가 대량 발송 후 보낸편지함 반영까지
+        # 몇십 초 걸리는 경우가 있어서 한 번만 확인하면 '발송 대기'로
+        # 남아버린다.  5초 간격으로 최대 60초(=12회)까지 자동 재확인.
+        self._delivery_poll_attempts_left = 12
+        self.after(3000, self._poll_outlook_delivery_status)
         return
         self.unprocessed_send_button.configure(state="normal" if self._unprocessed_card_uses else "disabled")
         self.unprocessed_status_var.set("Outlook 발송 결과를 메일 Log에 기록했습니다.")
+
+    def _poll_outlook_delivery_status(self) -> None:
+        """미결(발송 대기/확인 불가) 항목이 없어질 때까지 주기적으로 재확인."""
+        pending_before = sum(
+            1 for item in self.repository.recent_mail_logs()
+            if item.status in {"발송 대기", "발송 확인 불가"} and item.outlook_message_id
+        )
+        self._refresh_outlook_delivery_status()
+        pending_after = sum(
+            1 for item in self.repository.recent_mail_logs()
+            if item.status in {"발송 대기", "발송 확인 불가"} and item.outlook_message_id
+        )
+        attempts_left = getattr(self, "_delivery_poll_attempts_left", 0) - 1
+        self._delivery_poll_attempts_left = attempts_left
+        # 모두 확인됐거나 시도 횟수를 다 썼으면 종료.
+        if pending_after == 0 or attempts_left <= 0:
+            if hasattr(self, "unprocessed_status_var"):
+                if pending_after == 0:
+                    self.unprocessed_status_var.set(
+                        f"발송 결과 확인 완료: {pending_before}건 최신화됨"
+                    )
+                else:
+                    self.unprocessed_status_var.set(
+                        f"발송 결과 확인 종료: 미확인 {pending_after}건 (Outlook 재확인 필요)"
+                    )
+            return
+        # 아직 확인 안 된 항목이 있으면 5초 뒤 재시도.
+        if hasattr(self, "unprocessed_status_var"):
+            self.unprocessed_status_var.set(
+                f"발송 결과 확인 중... 대기 {pending_after}건 (남은 재시도 {attempts_left}회)"
+            )
+        self.after(5000, self._poll_outlook_delivery_status)
 
     def _refresh_outlook_delivery_status(self) -> None:
         updated = 0
