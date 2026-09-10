@@ -188,6 +188,37 @@ class OcrValidationTests(unittest.TestCase):
         )
         self.assertTrue(comma_damaged.checks[0].is_match)
 
+    def test_kicc_bracketed_approval_with_combined_korean_ocr_glyph_is_repaired(self) -> None:
+        transaction = replace(
+            _transaction(),
+            approval_number="17104411",
+            evidence_date="2026-09-07",
+            amount=Decimal("1900"),
+        )
+        result = evaluate_ocr_text(
+            transaction,
+            "카드결제 1,900원 [l箋D4411] KICJ로제출 POS 09-07 08:38",
+        )
+
+        self.assertEqual("정상", result.status)
+        self.assertTrue(result.checks[0].is_match)
+        self.assertEqual("17104411", result.checks[0].detected_value)
+        self.assertIn("KICC 카드전표", result.checks[0].reason)
+        self.assertTrue(result.checks[1].is_match)
+
+        no_kicc_context = evaluate_ocr_text(
+            transaction,
+            "카드결제 1,900원 [l箋D4411] 참조번호 POS 09-07 08:38",
+        )
+        self.assertFalse(no_kicc_context.checks[0].is_match)
+
+        kicc_korean_ocr = evaluate_ocr_text(
+            transaction,
+            "카드결제 1,900원 [I箋04411] K표:로제출 POS 09-07 08:38",
+        )
+        self.assertTrue(kicc_korean_ocr.checks[0].is_match)
+        self.assertEqual("17104411", kicc_korean_ocr.checks[0].detected_value)
+
     def test_gas_station_approval_number_lookalikes_are_repaired_only_after_label(self) -> None:
         transaction = replace(_transaction(), approval_number="22502602")
         result = evaluate_ocr_text(
