@@ -345,6 +345,48 @@ def _approval_check(transaction: UnsubmittedTransaction, text: str, tokens: tupl
                 reason="승인번호 라벨 문맥의 숫자 OCR 보정 일치",
             )
 
+    # KICC 카드전표에는 ``[승인번호] KICC...`` 형식의 줄이 별도로 인쇄된다.
+    # 이 거래의 실제 OCR처럼 ``[I箋04411] K표:로제출``로 읽힐 수 있다. 여기서
+    # ``I``은 1, ``箋``은 붙어 인식된 71, ``D``는 0의 오인 사례다. 이 보정은
+    # KICC 바로 앞의 대괄호 값에만 적용하고, 보정 뒤 전체 숫자열이 e-Acc
+    # 승인번호와 정확히 같을 때만 통과시킨다. 뒷자리(예: 4411)만 같은 경우는
+    # 절대로 통과하지 않는다.
+    kicc_candidates = re.findall(
+        # KICC의 마지막 C도 OCR에서 J 등 한 글자로 바뀔 수 있고, 실제 전표에서는
+        # ``KICC로제출`` 전체가 ``K표:로제출``로 바뀌기도 한다. 어느 경우든
+        # 대괄호 값 바로 뒤의 KICC/로제출 문맥을 모두 갖춰야 한다.
+        r"\[([^\]\r\n]{4,16})\]\s*(?:KIC(?:C|[A-Za-z가-힣])|K[가-힣][^\r\n]{0,4}로\s*제출)",
+        text,
+        flags=re.IGNORECASE,
+    )
+    kicc_lookalikes = str.maketrans(
+        {
+            "O": "0",
+            "o": "0",
+            "I": "1",
+            "l": "1",
+            "|": "1",
+            "/": "7",
+            "D": "0",
+            "d": "0",
+            # KICC 줄의 실제 Windows OCR 오인 사례: 한 글자에 '71'이 합쳐진다.
+            "箋": "71",
+            # 같은 글꼴에서 드물게 보이는 대체 인식값도 KICC 문맥으로 한정한다.
+            "笋": "71",
+        }
+    )
+    for candidate in kicc_candidates:
+        repaired = candidate.translate(kicc_lookalikes)
+        repaired_digits = re.sub(r"\D", "", repaired)
+        if repaired_digits == expected:
+            return ReceiptFieldCheck(
+                field_name="승인번호",
+                expected_value=expected,
+                detected_value=repaired_digits,
+                is_match=True,
+                reason="KICC 카드전표 승인번호 OCR 보정 일치",
+            )
+
     # OCR은 대괄호·영문자와 붙은 8자리 승인번호의 한 글자를 자주 덧붙이거나 놓친다.
     # 일반 숫자 전체에 적용하면 날짜·금액을 오인할 수 있으므로, 승인 문맥에서만 허용한다.
     context_parts = re.findall(
@@ -407,7 +449,9 @@ def _date_check(transaction: UnsubmittedTransaction, text: str, tokens: tuple[st
     month_day_pattern = rf"(?<!\d)0?{int(month)}\D{{0,3}}0?{int(day)}(?!\d)"
     for match in re.finditer(month_day_pattern, date_text):
         context = date_text[max(0, match.start() - 90) : match.end() + 90]
-        if re.search(r"POS|결제|일시|판매", context, flags=re.IGNORECASE):
+        # date_text에서는 숫자 보정 때문에 POS가 P0S로 바뀔 수 있다.
+        # 따라서 이 결제 시각 문맥도 함께 인정한다.
+        if re.search(r"P[O0]S|결제|일시|판매", context, flags=re.IGNORECASE):
             return ReceiptFieldCheck(
                 field_name="증빙일자",
                 expected_value=transaction.evidence_date,
