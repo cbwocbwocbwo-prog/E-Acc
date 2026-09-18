@@ -33,6 +33,7 @@
   html, body {
     margin: 0;
     height: 100%;
+    overflow: hidden;
     background: var(--bg-base);
     color: var(--text-primary);
     font-family: "Inter", "Noto Sans KR", -apple-system, sans-serif;
@@ -43,7 +44,8 @@
   .app-shell {
     display: grid;
     grid-template-columns: 216px 1fr;
-    min-height: 100vh;
+    height: 100vh;
+    min-height: 0;
   }
 
   /* ---------- Sidebar ---------- */
@@ -111,7 +113,14 @@
   .sidebar-footer .dot { width: 6px; height: 6px; border-radius: 50%; background: var(--text-faint); }
 
   /* ---------- Main ---------- */
-  .main { padding: 22px 28px 28px; min-width: 0; }
+  .main {
+    padding: 22px 28px 28px;
+    min-width: 0;
+    min-height: 0;
+    overflow: hidden;
+    display: flex;
+    flex-direction: column;
+  }
 
   .header-row {
     display: flex;
@@ -194,8 +203,11 @@
   .tab-btn.active { color: var(--text-primary); font-weight: 600; }
   .tab-btn.active::after { content: ""; position: absolute; left: 0; right: 0; bottom: -1px; height: 2px; background: var(--accent); border-radius: 2px; }
 
-  .tab-panel { display: none; margin-top: 14px; }
-  .tab-panel.active { display: block; }
+  /* 탭 표는 고정 높이가 아니라 창에서 남는 세로 공간을 모두 사용한다.
+     창을 줄이면 표 자체에만 스크롤이 생기므로 상단 안내와 탭은 항상 보인다. */
+  #tabPanels { display: flex; flex: 1 1 auto; min-height: 0; }
+  .tab-panel { display: none; margin-top: 14px; min-width: 0; }
+  .tab-panel.active { display: flex; flex: 1 1 auto; flex-direction: column; min-height: 0; }
 
   .filter-banner {
     display: flex; align-items: center; gap: 10px;
@@ -207,10 +219,39 @@
     background: none; border: 1px solid var(--accent); color: var(--accent);
     border-radius: 5px; font-size: 11px; padding: 2px 8px; cursor: pointer; font-family: inherit;
   }
+  .exception-mail-action {
+    margin-left: auto; background: none; border: 0; color: var(--accent);
+    padding: 2px 0; font: inherit; font-size: 12px; text-decoration: underline;
+    text-underline-offset: 2px; cursor: pointer;
+  }
+  .exception-mail-action:hover { color: var(--text-primary); }
+
+  /* 자동 전표처리 Log 전용: 기존 표와 같은 톤의 한 줄 필터다. 탭 밖의
+     화면 구성은 바꾸지 않고, 창 폭이 좁을 때만 자연스럽게 다음 줄로 넘긴다. */
+  .log-filter {
+    display: flex; flex: 0 0 auto; align-items: end; flex-wrap: wrap; gap: 8px 10px;
+    padding: 9px 11px; margin-bottom: 10px;
+    background: var(--surface-1); border: 1px solid var(--border); border-radius: var(--radius-md);
+  }
+  .log-filter-field { display: flex; flex-direction: column; gap: 4px; }
+  .log-filter-field label { font-size: 10.5px; color: var(--text-faint); }
+  .log-filter-field input, .log-filter-field select {
+    width: 118px; height: 28px; padding: 4px 7px;
+    color: var(--text-primary); background: var(--surface-2); border: 1px solid var(--border);
+    border-radius: 5px; font: inherit;
+  }
+  .log-filter-field input.wide, .log-filter-field select.wide { width: 148px; }
+  .log-filter-field input:focus-visible, .log-filter-field select:focus-visible { outline: 2px solid var(--accent); outline-offset: 1px; }
+  .log-filter-reset {
+    height: 28px; padding: 4px 10px; border: 1px solid var(--border); border-radius: 5px;
+    color: var(--text-secondary); background: var(--surface-2); font: inherit; font-size: 11.5px; cursor: pointer;
+  }
+  .log-filter-reset:hover { color: var(--text-primary); border-color: var(--text-faint); }
+  .log-filter-count { align-self: center; margin-left: auto; padding-bottom: 5px; color: var(--text-faint); font-size: 11px; }
 
   .table-scroll {
     border: 1px solid var(--border); border-radius: var(--radius-md);
-    overflow: auto; max-height: 460px; background: var(--surface-1);
+    overflow: auto; flex: 1 1 auto; min-height: 160px; background: var(--surface-1);
   }
   table { border-collapse: collapse; width: max-content; min-width: 100%; }
   thead th {
@@ -234,7 +275,7 @@
   .status-pill.warning { color: var(--warning); } .status-pill.warning .dot { background: var(--warning); }
   .status-pill.info { color: var(--info); } .status-pill.info .dot { background: var(--info); }
 
-  .table-footer { margin-top: 10px; display: flex; justify-content: space-between; font-size: 11.5px; color: var(--text-faint); }
+  .table-footer { margin-top: 10px; flex: 0 0 auto; display: flex; justify-content: space-between; font-size: 11.5px; color: var(--text-faint); }
 
   /* 검증 기준 모달 (기존 tkinter Toplevel을 대체). 웹뷰 뒤로 숨는 문제
      자체를 없애기 위해 웹 화면 안에서 오버레이로 표시한다. */
@@ -277,6 +318,9 @@
     font-family: inherit; cursor: pointer;
   }
   .modal-card footer button:hover { filter: brightness(1.1); }
+  .exception-mail-confirm-card { width: min(460px, calc(100vw - 36px)); min-height: 0; }
+  .exception-mail-confirm-card .modal-body { color: var(--text-secondary); line-height: 1.65; }
+  .exception-mail-confirm-card .confirm-button { background: var(--accent); color: #fff; border-color: var(--accent); }
 </style>
 </head>
 <body>
@@ -343,7 +387,7 @@
     </div>
 
     <div class="toolbar-row">
-      <span class="note">정상 행은 검증 후 결재요청까지 자동 진행합니다. PG일반은 입력값 확인 후 자동으로 이어집니다.</span>
+      <span class="note">정상 행은 검증 후 결재요청까지 자동 진행합니다. PG일반·기타4는 입력값 확인 후 자동으로 이어집니다.</span>
     </div>
 
     <div class="tabs" id="tabBar"></div>
@@ -370,6 +414,26 @@
     </div>
     <footer>
       <button type="button" onclick="closeGuideModal()">닫기</button>
+    </footer>
+  </div>
+</div>
+
+<!-- 기본 window.confirm은 일부 WebView2 환경에서 표시되지 않으므로, 발송
+     확인도 앱 내부 모달로 직접 표시한다. -->
+<div class="modal-overlay" id="exceptionMailConfirmModal" onclick="onExceptionMailOverlayClick(event)">
+  <div class="modal-card exception-mail-confirm-card" role="dialog" aria-modal="true" aria-labelledby="exceptionMailConfirmTitle">
+    <header>
+      <h2 id="exceptionMailConfirmTitle">팀 담당자 메일 발송</h2>
+      <p>오늘 처리된 예외처리 건</p>
+    </header>
+    <div class="modal-body">
+      오늘 처리한 영수증 등록 예외처리 건만 팀 담당자에게 메일로 발송합니다.<br>
+      영수증 미등록·동기화 대기·재조회 필요 건은 제외됩니다.<br><br>
+      발송하시겠습니까?
+    </div>
+    <footer>
+      <button type="button" onclick="closeExceptionTeamMailConfirm()">취소</button>
+      <button type="button" class="confirm-button" onclick="confirmExceptionTeamMail()">발송</button>
     </footer>
   </div>
 </div>
@@ -401,6 +465,27 @@ function openMailWindow() {
   // 먼저 파이썬으로 아이디/비밀번호를 넘긴 다음 실행한다.
   sendLoginFields();
   callApi('open_mail_window');
+}
+
+function sendExceptionTeamMail() {
+  document.getElementById("exceptionMailConfirmModal").classList.add("open");
+}
+
+function closeExceptionTeamMailConfirm() {
+  document.getElementById("exceptionMailConfirmModal").classList.remove("open");
+}
+
+function onExceptionMailOverlayClick(event) {
+  if (event.target && event.target.id === "exceptionMailConfirmModal") closeExceptionTeamMailConfirm();
+}
+
+function confirmExceptionTeamMail() {
+  closeExceptionTeamMailConfirm();
+  callApi('send_exception_team_mail').then(result => {
+    if (result && result.message) document.getElementById('statusText').textContent = result.message;
+  }).catch(() => {
+    document.getElementById('statusText').textContent = "팀 담당자 메일 발송을 시작하지 못했습니다. Mail_발송_Log를 확인해 주세요.";
+  });
 }
 
 function selectRow(tabId, rowId) {
@@ -466,7 +551,10 @@ function onGuideOverlayClick(event) {
 }
 
 document.addEventListener("keydown", event => {
-  if (event.key === "Escape") closeGuideModal();
+  if (event.key === "Escape") {
+    closeGuideModal();
+    closeExceptionTeamMailConfirm();
+  }
 });
 
 /* ---------- 탭/표 정의 ---------- */
@@ -479,21 +567,21 @@ const TAB_DEFS = {
   },
   results: {
     label: "자동_처리결과",
-    columns: ["처리시간","승인번호","증빙일자","사용금액","계정명","거래처","영수증 검증","계정 검증","PG 처리","결재 처리","최종 결과","핵심 사유","내부거래ID"],
+    columns: ["처리시간","승인번호","증빙일자","사용금액","계정명","거래처","영수증 검증","계정 검증","PG 처리","결재 처리","최종 결과","핵심 사유","내부거래ID","팀 명"],
     badgeCol: "최종 결과",
-    tagMap: { "결과-예외처리": "danger", "결과-PG등록대기": "warning", "결과-처리대상": "info" },
+    tagMap: { "결과-예외처리": "danger", "결과-증빙예외": "warning", "결과-PG등록대기": "warning", "결과-처리대상": "info" },
     defaultBadgeClass: "success",
   },
   mail: {
     label: "Mail_발송_Log",
-    columns: ["처리시간","성명","이메일","대상 건수","메일 제목","상태","상세 사유"],
+    columns: ["처리시간","성명","이메일","대상 건수","메일 제목","상태","상세 사유","팀 명"],
     badgeCol: "상태",
     tagMap: { "mail-error": "danger", "mail-warning": "warning" },
     defaultBadgeClass: "success",
   },
   processing: {
     label: "자동_전표처리_Log",
-    columns: ["시각","상태","승인번호","증빙일자","금액","거래처","사유","내부거래ID"],
+    columns: ["시각","상태","승인번호","증빙일자","금액","계정명","거래처","사유","내부거래ID"],
     badgeCol: "상태",
     textClassify: (text) => {
       if (text.includes("실패") || text.includes("오류")) return "danger";
@@ -514,6 +602,12 @@ let tableData = { transactions: [], results: [], mail: [], processing: [], expor
 let selectedRowByTab = {};
 let resultFilter = null; // "completed" | "exception" | "pg_pending" | null
 const FILTER_TEXT = { completed: "처리 완료", exception: "예외처리", pg_pending: "PG 등록" };
+const processingLogFilters = {
+  date: "", approvalNumber: "", evidenceDate: "", amount: "", merchant: "", accountName: "",
+};
+let processingLogCompositionActive = false;
+let processingLogFilterRenderTimer = null;
+let processingLogFilterNeedsRender = false;
 
 function badgeClassFor(tabId, tags, text) {
   const def = TAB_DEFS[tabId];
@@ -572,6 +666,9 @@ function buildTabsUI() {
 function switchTab(tabId) {
   document.querySelectorAll(".tab-btn").forEach(b => b.classList.toggle("active", b.dataset.tabId === tabId));
   document.querySelectorAll(".tab-panel").forEach(p => p.classList.toggle("active", p.id === "panel-" + tabId));
+  // Mail_발송_Log을 열었을 때만 최근 미확인 건을 백그라운드에서
+  // 재확인한다. 발송 중 Outlook을 건드리지 않아 동기화 충돌을 피한다.
+  if (tabId === "mail") callApi('refresh_mail_delivery');
 }
 
 function clearFilter() {
@@ -596,16 +693,152 @@ function matchesResultFilter(row, def) {
   return finalIndex >= 0 && String(row.values[finalIndex]) === FILTER_TEXT[resultFilter];
 }
 
+function processingLogCell(row, columnName) {
+  const index = TAB_DEFS.processing.columns.indexOf(columnName);
+  return index >= 0 ? String(row.values[index] ?? "") : "";
+}
+
+function normalizedFilterText(value) {
+  return String(value ?? "").replace(/\s+/g, "").toLocaleLowerCase();
+}
+
+function matchesProcessingLogFilter(row) {
+  const filters = processingLogFilters;
+  const loggedAt = processingLogCell(row, "시각").slice(0, 10);
+  if (filters.date && loggedAt !== filters.date) return false;
+  if (filters.approvalNumber && processingLogCell(row, "승인번호") !== filters.approvalNumber) return false;
+  if (filters.evidenceDate && processingLogCell(row, "증빙일자") !== filters.evidenceDate) return false;
+  const amount = processingLogCell(row, "금액").replace(/[\s,원]/g, "");
+  if (filters.amount && amount !== filters.amount.replace(/[\s,원]/g, "")) return false;
+  if (filters.merchant && !normalizedFilterText(processingLogCell(row, "거래처")).includes(normalizedFilterText(filters.merchant))) return false;
+  if (filters.accountName && normalizedFilterText(processingLogCell(row, "계정명")) !== normalizedFilterText(filters.accountName)) return false;
+  return true;
+}
+
+function setProcessingLogFilter(name, value) {
+  if (!(name in processingLogFilters)) return;
+  // 한글 IME는 'ㅂ' → '바'처럼 조합 중간마다 input 이벤트를 발생시킨다.
+  // 그때 표를 다시 그리면 입력 요소가 교체되어 다음 자음이 분리되므로, 조합
+  // 완료(compositionend) 시점에만 실제 필터링을 실행한다.
+  if (processingLogCompositionActive) return;
+  processingLogFilters[name] = value || "";
+  scheduleProcessingLogFilterRender();
+}
+
+function scheduleProcessingLogFilterRender() {
+  if (processingLogFilterRenderTimer !== null) {
+    window.clearTimeout(processingLogFilterRenderTimer);
+  }
+  // 필터 결과를 즉시 그리지 않고 잠시 기다린다. 이 시간에는 한글 IME가
+  // 조합 완료값을 입력창에 확정하므로, DOM 교체가 자음·모음 분리를 만들지
+  // 않는다. 숫자·영문은 사용자가 멈춘 직후 동일하게 갱신된다.
+  processingLogFilterRenderTimer = window.setTimeout(() => {
+    processingLogFilterRenderTimer = null;
+    if (processingLogCompositionActive) {
+      scheduleProcessingLogFilterRender();
+      return;
+    }
+    // 필터 결과를 갱신하려고 입력창을 교체하면, 한글 IME의 받침 확정이
+    // 깨질 수 있다. 입력창에 포커스가 있는 동안에는 결과 갱신을 보류하고
+    // 사용자가 필드를 벗어난 뒤에만 실행한다.
+    if (isEditingProcessingLogFilter()) {
+      processingLogFilterNeedsRender = true;
+      return;
+    }
+    processingLogFilterNeedsRender = false;
+    renderTable("processing");
+  }, 180);
+}
+
+function flushProcessingLogFilterRender() {
+  // blur 직후 다음 필터를 클릭했을 수 있으므로, 브라우저가 새 포커스를
+  // 결정한 뒤에 한 번만 확인한다.
+  window.setTimeout(() => {
+    if (!processingLogFilterNeedsRender || isEditingProcessingLogFilter()) return;
+    processingLogFilterNeedsRender = false;
+    renderTable("processing");
+  }, 0);
+}
+
+function beginProcessingLogComposition() {
+  processingLogCompositionActive = true;
+}
+
+function endProcessingLogComposition(name, value) {
+  processingLogCompositionActive = false;
+  setProcessingLogFilter(name, value);
+}
+
+function clearProcessingLogFilters() {
+  if (processingLogFilterRenderTimer !== null) {
+    window.clearTimeout(processingLogFilterRenderTimer);
+    processingLogFilterRenderTimer = null;
+  }
+  processingLogFilterNeedsRender = false;
+  Object.keys(processingLogFilters).forEach(name => { processingLogFilters[name] = ""; });
+  renderTable("processing");
+}
+
+function processingLogAccountNames() {
+  return [...new Set((tableData.processing || [])
+    .map(row => processingLogCell(row, "계정명").trim())
+    .filter(Boolean))]
+    .sort((left, right) => left.localeCompare(right, "ko-KR"));
+}
+
+function processingLogFilterHtml(visibleCount, totalCount) {
+  const field = (label, name, type = "text", wide = false, placeholder = "") => {
+    const compositionEvents = type === "text"
+      ? `oncompositionstart="beginProcessingLogComposition()" oncompositionend="endProcessingLogComposition('${name}', this.value)"`
+      : "";
+    return `<div class="log-filter-field"><label for="processing-filter-${name}">${label}</label>` +
+    `<input id="processing-filter-${name}" type="${type}" class="${wide ? "wide" : ""}" ` +
+    `value="${escapeHtml(processingLogFilters[name])}" placeholder="${placeholder}" ` +
+    `oninput="setProcessingLogFilter('${name}', this.value)" onblur="flushProcessingLogFilterRender()" ` +
+    `onkeydown="if (event.key === 'Enter') this.blur()" ${compositionEvents}></div>`;
+  };
+  const accountOptions = processingLogAccountNames().map(accountName =>
+    `<option value="${escapeHtml(accountName)}"${accountName === processingLogFilters.accountName ? " selected" : ""}>${escapeHtml(accountName)}</option>`
+  ).join("");
+  const accountField = `<div class="log-filter-field"><label for="processing-filter-accountName">계정명</label>` +
+    `<select id="processing-filter-accountName" class="wide" onchange="setProcessingLogFilter('accountName', this.value)" onblur="flushProcessingLogFilterRender()">` +
+    `<option value="">전체</option>${accountOptions}</select></div>`;
+  return `<div class="log-filter">` +
+    field("시각(날짜)", "date", "date") +
+    field("승인번호", "approvalNumber", "text", false, "정확히 입력") +
+    field("증빙일자", "evidenceDate", "date") +
+    field("금액", "amount", "text", false, "예: 7,700") +
+    accountField +
+    field("거래처", "merchant", "text", true, "포함 검색") +
+    `<button type="button" class="log-filter-reset" onclick="clearProcessingLogFilters()">초기화</button>` +
+    `<span class="log-filter-count">${visibleCount.toLocaleString("ko-KR")} / ${totalCount.toLocaleString("ko-KR")}건</span>` +
+    `</div>`;
+}
+
 function renderTable(tabId) {
   const def = TAB_DEFS[tabId];
   const panel = document.getElementById("panel-" + tabId);
   let rows = tableData[tabId] || [];
+  const activeFilter = tabId === "processing" && isEditingProcessingLogFilter()
+    ? document.activeElement
+    : null;
+  const activeFilterId = activeFilter ? activeFilter.id : "";
+  const activeSelectionStart = activeFilter instanceof HTMLInputElement ? activeFilter.selectionStart : null;
+  const activeSelectionEnd = activeFilter instanceof HTMLInputElement ? activeFilter.selectionEnd : null;
 
   let banner = "";
   if (tabId === "results" && resultFilter) {
     const visibleCount = rows.filter(r => matchesResultFilter(r, def)).length;
-    banner = `<div class="filter-banner">필터: ${FILTER_TEXT[resultFilter]} (${visibleCount}건) <button onclick="clearFilter()">해제</button></div>`;
+    const exceptionMailAction = resultFilter === "exception"
+      ? `<button type="button" class="exception-mail-action" onclick="sendExceptionTeamMail()">팀 담당자 메일발송 (예외처리 건)</button>`
+      : "";
+    banner = `<div class="filter-banner">필터: ${FILTER_TEXT[resultFilter]} (${visibleCount}건) <button onclick="clearFilter()">해제</button>${exceptionMailAction}</div>`;
     rows = rows.filter(r => matchesResultFilter(r, def));
+  }
+  if (tabId === "processing") {
+    const totalCount = rows.length;
+    rows = rows.filter(matchesProcessingLogFilter);
+    banner = processingLogFilterHtml(rows.length, totalCount);
   }
 
   const thead = "<thead><tr>" + def.columns.map(c => `<th>${c}</th>`).join("") + "</tr></thead>";
@@ -637,10 +870,37 @@ function renderTable(tabId) {
     newScroll.scrollLeft = prevScrollLeft;
     newScroll.scrollTop = prevScrollTop;
   }
+  // 사용자가 한 글자를 입력할 때마다 필터 결과 표는 갱신하되, 입력창 자체의
+  // 포커스와 커서 위치는 바로 새 DOM으로 돌려준다.
+  if (activeFilterId) {
+    const restored = document.getElementById(activeFilterId);
+    if (restored instanceof HTMLInputElement || restored instanceof HTMLSelectElement) {
+      restored.focus({ preventScroll: true });
+      if (
+        restored instanceof HTMLInputElement
+        && activeSelectionStart !== null
+        && activeSelectionEnd !== null
+      ) {
+        restored.setSelectionRange(activeSelectionStart, activeSelectionEnd);
+      }
+    }
+  }
 }
 
 function renderAllTables() {
-  Object.keys(TAB_DEFS).forEach(renderTable);
+  Object.keys(TAB_DEFS).forEach(tabId => {
+    // Python 상태는 0.4초마다 갱신된다. 필터 입력 중인 탭까지 통째로 다시
+    // 그리면 포커스·커서·날짜 선택창이 사라지므로, 편집을 끝낼 때까지는
+    // 처리 Log 표만 현재 DOM을 유지한다. 다른 표와 상단 상태는 계속 갱신된다.
+    if (tabId === "processing" && isEditingProcessingLogFilter()) return;
+    renderTable(tabId);
+  });
+}
+
+function isEditingProcessingLogFilter() {
+  const active = document.activeElement;
+  const isFilterControl = active instanceof HTMLInputElement || active instanceof HTMLSelectElement;
+  return isFilterControl && active.id.startsWith("processing-filter-");
 }
 
 /* ---------- 파이썬(tkinter)에서 상태가 올 때마다 호출됨 ---------- */
@@ -652,7 +912,17 @@ function updateState(state) {
   document.getElementById('targetText').textContent = state.currentTarget || "";
   document.getElementById('stageText').textContent = state.currentStage || "";
   document.getElementById('statusText').textContent = state.statusMessage || "";
-  document.getElementById('startBtn').disabled = !!state.busy;
+  const processingControl = state.processingControl || {
+    mode: 'start', label: '자동 처리 시작', enabled: !state.busy,
+  };
+  const startButton = document.getElementById('startBtn');
+  const pauseIcon = '<svg width="14" height="14" viewBox="0 0 24 24" fill="currentColor"><path d="M7 5h4v14H7zM13 5h4v14h-4z"/></svg>';
+  const playIcon = '<svg width="14" height="14" viewBox="0 0 24 24" fill="currentColor"><path d="M8 5v14l11-7z"/></svg>';
+  const controlIcon = processingControl.mode === 'pause' ? pauseIcon :
+    (processingControl.mode === 'pause-requested' ? '' : playIcon);
+  startButton.disabled = !processingControl.enabled;
+  startButton.innerHTML = controlIcon +
+    '<span>' + escapeHtml(processingControl.label || '자동 처리 시작') + '</span>';
   if (state.syncedAt) {
     document.getElementById('syncedAtText').textContent = "마지막 동기화: " + state.syncedAt;
   }
