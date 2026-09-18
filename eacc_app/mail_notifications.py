@@ -8,33 +8,29 @@ accepted (or rejected) for the audit log.
 """
 
 from dataclasses import dataclass
-from datetime import datetime
+from datetime import datetime, timedelta
 from decimal import Decimal
 from html import escape
 import json
 import os
 import time
 from pathlib import Path
-from typing import Iterable
+from typing import Iterable, Mapping
 from uuid import uuid4
+
+from .models import ExceptionMailUse
 
 
 MAIL_SUBJECT = "[법인카드] 미등록 사용내역 등록 요청"
 LOCAL_SENDER_SETTINGS_FILENAME = "mail_sender.json"
 OL_FOLDER_DRAFTS = 16
 
-# Per-message pacing (seconds) between consecutive Send calls.  Now that
-# bulk sends queue into the Outbox instead of calling ``Send`` synchronously
-# (see below), Outlook no longer blocks the calling thread on Exchange, so
-# a small 0.15s spacing is enough to keep the COM automation responsive
-# without artificially slowing down the queue-up phase.
-BULK_SEND_PACING_SECONDS = 0.15
-
-# Outlook's ``Outbox`` default-folder constant (olFolderOutbox in the
-# Outlook object model).  Moving a saved draft into this folder is how the
-# bulk-send path enqueues messages without triggering the synchronous
-# Exchange handshake that ``MailItem.Send`` runs.
-OL_FOLDER_OUTBOX = 4
+# Outlook must receive a real Send request; merely moving a draft into the
+# Outbox does not submit it for delivery on every profile.  Pace those real
+# requests conservatively so a large batch cannot monopolise Outlook.
+BULK_SEND_PACING_SECONDS = 1.0
+BULK_SEND_BATCH_SIZE = 20
+BULK_SEND_BATCH_PAUSE_SECONDS = 10.0
 
 
 @dataclass(frozen=True, slots=True)
@@ -98,21 +94,54 @@ def render_mail_html(
 </td></tr></table></body></html>"""
 
 
+def render_exception_mail_html(
+    cost_center: str,
+    uses: Iterable[ExceptionMailUse],
+    process_date: str | None = None,
+) -> str:
+    """Render the team exception-mail template without receipt attachments."""
+    rows = tuple(uses)
+    if not rows:
+        raise ValueError("메일 본문에 넣을 예외처리 내역이 없습니다.")
+    process_date = process_date or datetime.now().strftime("%Y-%m-%d")
+    body_rows = "".join(
+        "<tr style=\"background:%s;\">"
+        "<td style=\"%s\">%d</td><td style=\"%s\">%s</td>"
+        "<td style=\"%s\">%s</td><td style=\"%s\">%s</td><td style=\"%s\">%s</td>"
+        "<td style=\"%s\">%s원</td><td style=\"%s\">%s</td></tr>"
+        % (
+            "#f8fafc" if index % 2 == 0 else "#ffffff",
+            _cell("center"), index, _cell("center"), escape(item.approval_number),
+            _cell("center"), escape(item.card_holder), _cell("center"), escape(item.evidence_date), _cell("left"), escape(item.merchant),
+            _cell("right"), f"{item.amount:,.0f}", _cell("left"), escape(_short_exception_reason(item.reason)),
+        )
+        for index, item in enumerate(rows, start=1)
+    )
+    return f"""<!doctype html>
+<html lang="ko"><body style="margin:0;padding:0;background:#ffffff;font-family:'Malgun Gothic',Arial,sans-serif;color:#102b4a;font-size:14px;line-height:1.65;">
+<table role="presentation" cellpadding="0" cellspacing="0" border="0" style="width:800px;max-width:800px;margin:0 auto;"><tr><td style="padding:20px 30px 0;">
+<div style="background:#f6f8fb;border-left:4px solid #c76a18;padding:18px 20px;margin-bottom:24px;">안녕하세요, {escape(cost_center)} 담당자님.<br>법인카드 자동 처리 중 담당자 확인이 필요한 예외처리 건이 검출 되었습니다.<br>아래 내역을 확인하시어 e-Acc에서 필요한 조치를 진행해 주세요.</div>
+<div style="font-weight:bold;color:#0f3c67;margin-bottom:7px;">법인카드 예외처리 내역</div>
+<table role="presentation" cellpadding="0" cellspacing="0" border="0" style="width:100%;border-collapse:collapse;table-layout:fixed;font-size:13px;"><colgroup><col style="width:5%"><col style="width:11%"><col style="width:10%"><col style="width:12%"><col style="width:17%"><col style="width:11%"><col style="width:34%"></colgroup><thead><tr style="background:#163a60;color:#ffffff;"><th style="padding:8px;white-space:nowrap;text-align:center;">순번</th><th style="padding:8px;white-space:nowrap;text-align:center;">승인번호</th><th style="padding:8px;white-space:nowrap;text-align:center;">카드소지자</th><th style="padding:8px;white-space:nowrap;text-align:center;">증빙일자</th><th style="padding:8px;white-space:nowrap;text-align:left;">거래처</th><th style="padding:8px;white-space:nowrap;text-align:right;">사용금액</th><th style="padding:8px;white-space:nowrap;text-align:left;">예외 사유</th></tr></thead><tbody>{body_rows}</tbody></table>
+<div style="background:#fff5e5;border:1px solid #ead8bc;border-top:0;padding:10px 12px;">대상 건수 <strong style="color:#d45d00;">{len(rows)}건</strong>&nbsp;·&nbsp;처리일 <strong style="color:#d45d00;">{escape(process_date)}</strong></div>
+<div style="margin-top:29px;">문의사항은 법인카드 자동처리 담당자에게 연락 바랍니다.<br><br>감사합니다.</div>
+<div style="margin-top:30px;padding:10px 12px;text-align:center;background:#f6f8fb;border-top:1px solid #dfe3e8;color:#7c8b9a;font-size:12px;">본 메일은 자동 발송되었습니다.</div>
+</td></tr></table></body></html>"""
+
+
 class OutlookSendContext:
     """A reusable Outlook COM handle plus resolved sender-account binding.
 
-    Bulk-send runs call ``Dispatch("Outlook.Application")`` and re-resolve
-    the sender account for every message when they use the simple
-    ``send_via_outlook`` entry point.  On profiles with several dozen
-    recipients each of those COM round-trips adds up, keeps the UI thread
-    marshalled to Outlook, and interacts badly with Exchange throttling,
-    which is exactly the "PC frozen for minutes" symptom.
+    Without a shared context each message would create a new Outlook COM
+    proxy and resolve the sender account again. On profiles with several
+    dozen recipients those COM round-trips add up and interact badly with
+    Exchange throttling.
 
     This context is built ONCE per bulk run and reused for every message,
     so the expensive discovery work happens a single time.
     """
 
-    __slots__ = ("outlook", "send_account", "sender_address", "last_send_at")
+    __slots__ = ("outlook", "send_account", "sender_address", "last_send_at", "sent_count")
 
     def __init__(self, outlook, send_account, sender_address: str) -> None:
         self.outlook = outlook
@@ -121,13 +150,22 @@ class OutlookSendContext:
         # to cross the COM boundary just to compare against a config value.
         self.sender_address = sender_address
         self.last_send_at = 0.0
+        self.sent_count = 0
+
+    def close(self) -> None:
+        """Release this program's COM references without closing Outlook."""
+        # Do not call Outlook.Application.Quit(): Outlook belongs to the user.
+        # Dropping our references lets pywin32 release the automation handles
+        # as soon as the bulk worker finishes.
+        self.send_account = None
+        self.outlook = None
 
 
 def open_outlook_send_context() -> OutlookSendContext:
     """Build a bulk-send context: resolve Outlook + the sender account once.
 
     Raises the same errors ``send_via_outlook`` would raise, so the caller
-    can surface configuration problems before the first message is queued.
+    can surface configuration problems before the first message is submitted.
     """
     try:
         import win32com.client  # type: ignore[import-not-found]
@@ -152,6 +190,7 @@ def send_via_outlook(
     recipient: MailRecipient,
     html_body: str,
     context: OutlookSendContext | None = None,
+    subject: str = MAIL_SUBJECT,
 ) -> tuple[str, str]:
     """Ask the locally configured Outlook client to deliver one HTML message.
 
@@ -178,10 +217,13 @@ def send_via_outlook(
     if context is None:
         context = open_outlook_send_context()
     else:
-        # Space consecutive Send() calls out so Exchange doesn't throttle
-        # (and Outlook doesn't wedge the UI thread waiting for a response).
+        # Space actual Send() calls out and give Outlook a short recovery
+        # window after each group of 20 requests. This runs on the dedicated
+        # mail worker, never on the UI thread.
         elapsed = time.monotonic() - context.last_send_at
-        if 0 < elapsed < BULK_SEND_PACING_SECONDS:
+        if context.sent_count and context.sent_count % BULK_SEND_BATCH_SIZE == 0:
+            time.sleep(max(0.0, BULK_SEND_BATCH_PAUSE_SECONDS - elapsed))
+        elif 0 < elapsed < BULK_SEND_PACING_SECONDS:
             time.sleep(BULK_SEND_PACING_SECONDS - elapsed)
 
     outlook = context.outlook
@@ -202,7 +244,7 @@ def send_via_outlook(
         # owner account at Send time and honors it.
         mail = _create_mail_in_account_store(send_account)
     mail.To = recipient.email
-    mail.Subject = MAIL_SUBJECT
+    mail.Subject = subject
     # Outlook may preserve UserProperties in the Outbox but not expose them
     # consistently while it is synchronizing.  Keep the same opaque ID in an
     # invisible HTML comment too, so later folder checks have a second,
@@ -242,38 +284,16 @@ def send_via_outlook(
                 "Outlook에서 해당 계정의 '보낸 사람으로 사용' 권한 또는 "
                 "기본 데이터 파일(파일 → 계정 설정 → 데이터 파일)을 확인해 주세요."
             )
-    # 예전엔 ``mail.Send()``를 바로 호출했다.  Send()는 동기 호출이라
-    # Exchange 서버 왕복이 끝날 때까지 Outlook COM 스레드를 붙잡고 있어서,
-    # 70명 발송 시 Outlook과 PC가 몇 분씩 얼어붙는 원인이 됐다.
-    #
-    # 대신 초안(mail)을 요청 계정의 Outbox 폴더로 이동시켜 큐잉만 한다.
-    # 그 다음부턴 Outlook이 자기 페이스로 백그라운드 발송을 하고,
-    # 우리 프로그램은 폴링으로 '보낸 편지함' 이동을 감지해 로그를 갱신한다.
-    #
-    # 참고: MoveTo는 로컬 스토어 조작이라 서버 왕복이 없다.  Save 직후
-    #       바로 호출해도 안전하다.
-    queued = False
-    try:
-        if send_account is not None:
-            outbox = send_account.DeliveryStore.GetDefaultFolder(OL_FOLDER_OUTBOX)
-        else:
-            outbox = outlook.GetNamespace("MAPI").GetDefaultFolder(OL_FOLDER_OUTBOX)
-        if outbox is not None:
-            mail.Move(outbox)
-            queued = True
-    except Exception:
-        # 이 프로필에서 Outbox 이동이 실패하면(예: POP3 즉시발송 계정)
-        # 옛날 방식으로 폴백한다.  이 경로는 Outlook을 잠깐 붙잡을 수
-        # 있지만 최소한 메일은 나간다.
-        queued = False
-    if not queued:
-        mail.Send()
+    # This is the real Outlook submission request. Unlike Move(Outbox), it
+    # marks the mail for delivery. Outlook/Exchange may complete delivery
+    # later, which is why the Log starts at '발송 요청' and is reconciled
+    # separately after the whole batch has been submitted.
+    mail.Send()
 
     if not owns_context:
         context.last_send_at = time.monotonic()
-    # Outbox에 큐잉된 상태이므로 '발송 대기'가 정확한 즉시 상태다.
-    # 이후 폴링이 '발송 완료'로 승격한다.
-    return "발송 대기", message_id
+        context.sent_count += 1
+    return "발송 요청", message_id
 
 
 def _create_mail_in_account_store(send_account):
@@ -343,12 +363,38 @@ def _list_outlook_smtp_addresses(outlook) -> str:
 
 
 def outlook_delivery_status(message_id: str) -> str:
-    """Check a prior message without sending another one."""
+    """Compatibility wrapper for checking one program message."""
+    return outlook_delivery_statuses((message_id,)).get(message_id, "발송 확인 불가")
+
+
+def outlook_delivery_statuses(
+    message_ids: Iterable[str],
+    *,
+    since: datetime | None = None,
+) -> dict[str, str]:
+    """Check one batch in one pass through the sender's recent folders.
+
+    Each message ID is a private token embedded in its mail.  The function
+    scans a folder once and resolves every token it finds, rather than
+    rescanning the same Outlook folder once per recipient.
+    """
+    requested_ids = {str(value) for value in message_ids if str(value)}
+    result = {message_id: "발송 확인 불가" for message_id in requested_ids}
+    if not requested_ids:
+        return result
     try:
         import win32com.client  # type: ignore[import-not-found]
     except ImportError:
-        return "발송 확인 불가"
-    return _outlook_delivery_status(win32com.client.Dispatch("Outlook.Application"), message_id)
+        return result
+    outlook = win32com.client.Dispatch("Outlook.Application")
+    try:
+        return _outlook_delivery_statuses(
+            outlook, requested_ids, _local_sender_address(), since=since
+        )
+    finally:
+        # This only releases the COM proxy created by this check. It never
+        # terminates the user's Outlook application.
+        del outlook
 
 
 def _find_outlook_account(outlook, sender_address: str):
@@ -392,43 +438,116 @@ def _local_sender_address() -> str:
     return ""
 
 
-def _outlook_delivery_status(outlook, message_id: str) -> str:
+def _outlook_delivery_statuses(
+    outlook,
+    requested_ids: set[str],
+    sender_address: str = "",
+    *,
+    since: datetime | None = None,
+) -> dict[str, str]:
     namespace = outlook.GetNamespace("MAPI")
+    result = {message_id: "발송 확인 불가" for message_id in requested_ids}
+    unresolved_ids = set(requested_ids)
+    # A message can be created a few minutes before its audit row is written.
+    # This buffer still confines the scan to the active delivery batch rather
+    # than Outlook's full historical folder.
+    cutoff = since - timedelta(minutes=5) if since is not None else None
     # Sent Items is checked first: a fast online send may leave Outbox before
     # this method is called.
     for folder_id, status in ((5, "발송 완료"), (4, "발송 대기")):
-        for folder in _outlook_folders_for_status(outlook, namespace, folder_id):
-            for index in range(1, folder.Items.Count + 1):
-                item = folder.Items.Item(index)
+        for folder in _outlook_folders_for_status(outlook, namespace, folder_id, sender_address):
+            items = folder.Items
+            try:
+                # Newest first means a newly sent item is found without a
+                # historical mailbox scan. CreationTime works for both Sent
+                # Items and Outbox folders.
+                items.Sort("[CreationTime]", True)
+            except Exception:
+                pass
+            try:
+                item_count = int(items.Count)
+            except Exception:
+                continue
+            for index in range(1, item_count + 1):
+                item = items.Item(index)
                 try:
+                    if cutoff is not None and _outlook_item_is_older_than(item, cutoff):
+                        # Items were sorted newest-first, so older history can
+                        # never contain this just-created batch.
+                        break
                     prop = item.UserProperties.Find("EAccAutomationMessageId")
-                    is_matching_property = prop is not None and str(prop.Value) == message_id
-                    is_matching_body = (
-                        f"EAccAutomationMessageId:{message_id}" in str(item.HTMLBody)
-                    )
-                    if is_matching_property or is_matching_body:
-                        return status
+                    message_id = str(prop.Value) if prop is not None else ""
+                    if message_id not in unresolved_ids:
+                        message_id = ""
+                    if not message_id:
+                        # UserProperties can be hidden while Outlook syncs;
+                        # the invisible body marker is the reliable fallback.
+                        body = str(item.HTMLBody)
+                        for candidate in unresolved_ids:
+                            if f"EAccAutomationMessageId:{candidate}" in body:
+                                message_id = candidate
+                                break
+                    if message_id in unresolved_ids:
+                        result[message_id] = status
+                        unresolved_ids.remove(message_id)
+                        if not unresolved_ids:
+                            return result
                 except Exception:
                     continue
-    return "발송 확인 불가"
+    return result
 
 
-def _outlook_folders_for_status(outlook, namespace, folder_id: int):
-    """Yield the default plus every configured account's matching folder."""
+def _outlook_item_is_older_than(item, cutoff: datetime) -> bool:
+    """Best-effort CreationTime cutoff that tolerates Outlook date variants."""
+    try:
+        created_at = item.CreationTime
+    except Exception:
+        return False
+    if not isinstance(created_at, datetime):
+        return False
+    if created_at.tzinfo is None and cutoff.tzinfo is not None:
+        cutoff = cutoff.replace(tzinfo=None)
+    elif created_at.tzinfo is not None and cutoff.tzinfo is None:
+        created_at = created_at.replace(tzinfo=None)
+    return created_at < cutoff
+
+
+def _outlook_folders_for_status(outlook, namespace, folder_id: int, sender_address: str = ""):
+    """Yield only the folder belonging to the actual sending account.
+
+    A per-PC override has a known sender account, so inspecting unrelated
+    accounts is incorrect as well as expensive.  Without an override Outlook's
+    default folder is the account used by the deployment path.
+    """
     folders = []
+    if sender_address:
+        account = _find_outlook_account(outlook, sender_address)
+        if account is not None:
+            try:
+                return (account.DeliveryStore.GetDefaultFolder(folder_id),)
+            except Exception:
+                return ()
     try:
         folders.append(namespace.GetDefaultFolder(folder_id))
     except Exception:
         pass
-    for index in range(1, outlook.Session.Accounts.Count + 1):
-        try:
-            folder = outlook.Session.Accounts.Item(index).DeliveryStore.GetDefaultFolder(folder_id)
-            if all(folder.EntryID != existing.EntryID for existing in folders):
-                folders.append(folder)
-        except Exception:
-            continue
     return tuple(folders)
 
 
 def _cell(alignment: str) -> str:
     return f"padding:9px 8px;border-bottom:1px solid #d9dde2;text-align:{alignment};"
+
+
+def _short_exception_reason(reason: str) -> str:
+    """Keep only the exception category, excluding volatile OCR detail."""
+    text = " ".join(str(reason or "").split())
+    # 음료전용 적요 검증은 음식·주류 등 음료 이외의 품목을 감지했을 때만
+    # 예외가 된다. 메일에서는 내부 검증 규칙명이 아니라 담당자가 바로
+    # 이해할 수 있는 조치 사유로 표시한다.
+    if text.startswith("음료전용 적요:"):
+        return "음료 외 내역 존재"
+    for separator in (":", "："):
+        if separator in text:
+            text = text.split(separator, 1)[0]
+            break
+    return text.rstrip(" /·")[:80]

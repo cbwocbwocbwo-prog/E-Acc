@@ -23,8 +23,13 @@ class BusinessNumberExtraction:
 
 
 def is_pg_business_type(business_type: str) -> bool:
-    """Return true for every current and future label containing ``PG일반``."""
-    return "PG일반" in (business_type or "")
+    """Return true when the business type requires PG merchant registration.
+
+    e-Acc labels both ``PG일반`` variants and ``기타4`` transactions as the
+    same real-merchant registration workflow target.
+    """
+    value = business_type or ""
+    return any(label in value for label in ("PG일반", "기타4"))
 
 
 def is_valid_business_number(value: str) -> bool:

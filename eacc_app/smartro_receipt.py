@@ -129,6 +129,9 @@ def validate_receipt_with_smartro_support(
     image_paths: tuple[Path, ...],
 ) -> ReceiptValidationResult:
     """Run the unchanged general verifier, then SmartroPAY-focused OCR if needed."""
+    # 음료전용 적요의 품목 판정도 아래의 기본 OCR 원문을 재사용한다.
+    # 별도 상품명 OCR을 추가로 실행하지 않으므로 날짜·승인번호·금액 OCR의
+    # 처리시간과 행 전체 처리시간에 추가 대기시간이 생기지 않는다.
     validation = ocr_validation.validate_receipt_images(transaction, image_paths)
     approval = _approval_check(validation)
     if approval is None or approval.is_match or not _is_smartro_receipt(transaction, validation):

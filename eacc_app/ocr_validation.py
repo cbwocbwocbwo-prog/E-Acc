@@ -1,11 +1,19 @@
 from __future__ import annotations
 
 import asyncio
+import atexit
+from dataclasses import replace
 from io import BytesIO
+import json
+from queue import Empty, Queue
 import re
 from pathlib import Path
+import subprocess
+import sys
+from threading import Thread
+import time
 
-from PIL import Image, ImageEnhance, ImageOps
+from PIL import Image, ImageEnhance, ImageFilter, ImageOps
 
 from .models import (
     ReceiptFieldCheck,
@@ -19,6 +27,16 @@ class OcrUnavailableError(RuntimeError):
 
 
 _OCR_ENGINE = None
+_MONITOR_PHOTO_WORKER: subprocess.Popen[str] | None = None
+
+# 일반 영수증의 빠른 기본 OCR은 제한하지 않는다. 이미 기본 OCR에서 정상으로
+# 판정되지 않은 건만 아래의 보조 재판독 예산을 사용한다. Windows OCR 호출은
+# 실행 중인 한 건을 강제로 취소할 수 없으므로, 호출 사이에서만 시간을 확인한다.
+_FAILURE_RETRY_BUDGET_SECONDS = 15.0
+
+
+def _deadline_reached(deadline: float | None) -> bool:
+    return deadline is not None and time.monotonic() >= deadline
 
 
 async def _recognize_image_bytes_async(data: bytes) -> str:
@@ -145,13 +163,227 @@ def _focused_bottom_bytes(path: Path, angle: int) -> bytes:
         return output.getvalue()
 
 
-def recognize_focused_bottom(paths: tuple[Path, ...], angle: int = 0) -> str:
+def recognize_focused_bottom(
+    paths: tuple[Path, ...],
+    angle: int = 0,
+    *,
+    deadline: float | None = None,
+) -> str:
     async def recognize_all() -> str:
         texts: list[str] = []
         for path in paths:
+            if _deadline_reached(deadline):
+                return "\n".join(texts)
             text = await _recognize_image_bytes_async(_focused_bottom_bytes(path, angle))
             if text:
                 texts.append(text)
+        return "\n".join(texts)
+
+    return asyncio.run(recognize_all())
+
+
+def _screen_capture_bytes(path: Path, angle: int) -> tuple[bytes, ...]:
+    """Prepare small digital receipts and photos of a monitor for OCR.
+
+    A browser receipt captured from a monitor is commonly only a few hundred
+    pixels wide.  The ordinary OCR input intentionally preserves that original
+    image for speed, but its thin approval-number glyphs can disappear.  This
+    fallback enlarges a lightly sharpened full document and a margin-trimmed
+    copy.  It is only called after the ordinary receipt path did not pass, so it
+    never adds work to normal rows.
+    """
+    with Image.open(path) as source:
+        image = source.rotate(angle, expand=True) if angle else source.copy()
+        grayscale = ImageOps.exif_transpose(image).convert("L")
+        width, height = grayscale.size
+        trimmed = grayscale.crop(
+            (int(width * 0.025), int(height * 0.02), int(width * 0.975), int(height * 0.98))
+        )
+        variants = (
+            grayscale,
+            ImageEnhance.Contrast(
+                ImageOps.autocontrast(grayscale, cutoff=1).filter(
+                    ImageFilter.UnsharpMask(radius=1.2, percent=135, threshold=2)
+                )
+            ).enhance(1.45),
+            ImageEnhance.Contrast(
+                ImageOps.autocontrast(trimmed, cutoff=1).filter(ImageFilter.MedianFilter(3))
+            ).enhance(1.8),
+        )
+        payloads: list[bytes] = []
+        for variant in variants:
+            scale = min(4.5, 2400 / max(variant.width, variant.height))
+            enlarged = variant.resize(
+                (max(1, round(variant.width * scale)), max(1, round(variant.height * scale))),
+                Image.Resampling.LANCZOS,
+            )
+            output = BytesIO()
+            enlarged.save(output, format="PNG")
+            payloads.append(output.getvalue())
+        return tuple(payloads)
+
+
+def recognize_screen_capture(
+    paths: tuple[Path, ...],
+    angle: int,
+    *,
+    deadline: float | None = None,
+) -> str:
+    """OCR a screen-captured or monitor-photographed receipt within a budget."""
+    async def recognize_all() -> str:
+        texts: list[str] = []
+        for path in paths:
+            for payload in _screen_capture_bytes(path, angle):
+                if _deadline_reached(deadline):
+                    return "\n".join(texts)
+                text = await _recognize_image_bytes_async(payload)
+                if text:
+                    texts.append(text)
+        return "\n".join(texts)
+
+    return asyncio.run(recognize_all())
+
+
+def recognize_monitor_photo(paths: tuple[Path, ...]) -> str:
+    """Use isolated local Korean OCR for a failed monitor-photo receipt only."""
+    if not paths:
+        return ""
+    # Windows OCR(winrt)과 EasyOCR(torch)는 같은 프로세스에서 DLL 초기화 충돌이
+    # 날 수 있다. 별도 프로세스로 실행하면 정상 건의 메모리·처리속도에는 전혀
+    # 영향을 주지 않으며, 실패한 화면 촬영본만 보조 OCR을 사용한다.
+    worker = (
+        "import easyocr, json, sys\n"
+        "reader = easyocr.Reader(['ko', 'en'], gpu=False, verbose=False)\n"
+        "for request in sys.stdin:\n"
+        "    paths = json.loads(request)\n"
+        "    texts = []\n"
+        "    for image_path in paths:\n"
+        "        texts.extend(reader.readtext(image_path, detail=0, paragraph=False))\n"
+        "    print(json.dumps(texts, ensure_ascii=False), flush=True)\n"
+    )
+    try:
+        process = _monitor_photo_worker(worker)
+        assert process.stdin is not None and process.stdout is not None
+        process.stdin.write(json.dumps([str(path) for path in paths]) + "\n")
+        process.stdin.flush()
+        response = _read_worker_response(process, timeout_seconds=30)
+        if not response:
+            return ""
+        values = json.loads(response)
+        return "\n".join(value for value in values if isinstance(value, str))
+    except (OSError, RuntimeError, ValueError, json.JSONDecodeError):
+        _stop_monitor_photo_worker()
+        return ""
+
+
+def _monitor_photo_worker(worker: str) -> subprocess.Popen[str]:
+    global _MONITOR_PHOTO_WORKER
+    if _MONITOR_PHOTO_WORKER is not None and _MONITOR_PHOTO_WORKER.poll() is None:
+        return _MONITOR_PHOTO_WORKER
+    _MONITOR_PHOTO_WORKER = subprocess.Popen(
+        [sys.executable, "-c", worker],
+        stdin=subprocess.PIPE,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.DEVNULL,
+        text=True,
+        encoding="utf-8",
+        errors="replace",
+    )
+    return _MONITOR_PHOTO_WORKER
+
+
+def _read_worker_response(
+    process: subprocess.Popen[str], *, timeout_seconds: float
+) -> str:
+    assert process.stdout is not None
+    responses: Queue[str] = Queue(maxsize=1)
+    Thread(target=lambda: responses.put(process.stdout.readline()), daemon=True).start()
+    try:
+        return responses.get(timeout=timeout_seconds)
+    except Empty:
+        _stop_monitor_photo_worker()
+        return ""
+
+
+def _stop_monitor_photo_worker() -> None:
+    global _MONITOR_PHOTO_WORKER
+    process, _MONITOR_PHOTO_WORKER = _MONITOR_PHOTO_WORKER, None
+    if process is not None and process.poll() is None:
+        process.terminate()
+        try:
+            process.wait(timeout=2)
+        except subprocess.TimeoutExpired:
+            process.kill()
+
+
+atexit.register(_stop_monitor_photo_worker)
+
+
+def _payment_detail_bytes(path: Path, angle: int) -> tuple[bytes, ...]:
+    """Create a few high-contrast versions of the card-payment detail block.
+
+    This is deliberately a *fallback* OCR source.  It is used only after the
+    normal full-receipt OCR has already found the expected amount but could not
+    read the approval number or date.  In particular, it helps photographed
+    paper receipts whose lower approval block is faded or creased.
+    """
+    with Image.open(path) as source:
+        image = source.rotate(angle, expand=True) if angle else source.copy()
+        grayscale = image.convert("L")
+        width, height = grayscale.size
+        # The approval number, approval date/time and paid amount generally
+        # occupy this lower-middle card-payment block.  Keep enough of the
+        # labels so that Windows OCR does not interpret a number as a product
+        # price, while excluding the mostly blank receipt margins.
+        block = grayscale.crop(
+            (int(width * 0.05), int(height * 0.48), int(width * 0.96), int(height * 0.92))
+        )
+        contrasted = ImageEnhance.Contrast(
+            ImageOps.autocontrast(block, cutoff=1)
+        ).enhance(2.8)
+        # 하나카드 등 종이 영수증의 승인번호 줄은 하단 전체를 읽을 때 접힌
+        # 선·공백에 묻히기 쉽다. 카드번호부터 결제일시까지의 왼쪽 결제정보
+        # 블록을 별도로 확대하면 숫자와 항목명이 함께 남는다.
+        approval_block = grayscale.crop(
+            (int(width * 0.05), int(height * 0.66), int(width * 0.75), int(height * 0.84))
+        )
+        approval_auto = ImageOps.autocontrast(approval_block, cutoff=1)
+        approval_contrasted = ImageEnhance.Contrast(approval_auto).enhance(2.0)
+        variants = [
+            block,
+            contrasted,
+            approval_auto,
+            approval_contrasted,
+        ]
+        payloads: list[bytes] = []
+        for variant in variants:
+            scale = min(3.0, 2400 / max(variant.width, variant.height))
+            enlarged = variant.resize(
+                (max(1, round(variant.width * scale)), max(1, round(variant.height * scale))),
+                Image.Resampling.LANCZOS,
+            )
+            output = BytesIO()
+            enlarged.save(output, format="PNG")
+            payloads.append(output.getvalue())
+        return tuple(payloads)
+
+
+def recognize_payment_details(
+    paths: tuple[Path, ...],
+    angle: int,
+    *,
+    deadline: float | None = None,
+) -> str:
+    """Read the lower payment block in a known receipt orientation."""
+    async def recognize_all() -> str:
+        texts: list[str] = []
+        for path in paths:
+            for payload in _payment_detail_bytes(path, angle):
+                if _deadline_reached(deadline):
+                    return "\n".join(texts)
+                text = await _recognize_image_bytes_async(payload)
+                if text:
+                    texts.append(text)
         return "\n".join(texts)
 
     return asyncio.run(recognize_all())
@@ -188,11 +420,148 @@ def _approval_line_bytes(path: Path, angle: int) -> tuple[bytes, ...]:
         return tuple(payloads)
 
 
-def recognize_approval_lines(paths: tuple[Path, ...], angle: int = 0) -> str:
+def recognize_approval_lines(
+    paths: tuple[Path, ...],
+    angle: int = 0,
+    *,
+    deadline: float | None = None,
+) -> str:
     async def recognize_all() -> str:
         texts: list[str] = []
         for path in paths:
             for payload in _approval_line_bytes(path, angle):
+                if _deadline_reached(deadline):
+                    return "\n".join(texts)
+                text = await _recognize_image_bytes_async(payload)
+                if text:
+                    texts.append(text)
+        return "\n".join(texts)
+
+    return asyncio.run(recognize_all())
+
+
+def _critical_transaction_detail_bytes(path: Path, angle: int) -> tuple[bytes, ...]:
+    """Create narrow OCR inputs for date, approval number, and paid amount.
+
+    This is a last-resort path for photographed card slips.  A full-page OCR
+    can merge the thin numeric characters with a patterned background even
+    when the three fields are plainly visible to a person.  The three bands
+    keep the transaction timestamp, approval block, and total block separate.
+    """
+    with Image.open(path) as source:
+        image = source.rotate(angle, expand=True) if angle else source.copy()
+        grayscale = image.convert("L")
+        width, height = grayscale.size
+        payloads: list[bytes] = []
+
+        # 일부 증빙은 영수증 자체가 아니라 모니터의 결제 팝업을 촬영한 사진이다.
+        # 이 경우 화면 격자무늬가 숫자 획과 겹치므로, 중앙의 영수증 창만 잘라
+        # 약한 중앙값 필터를 적용한 한 장을 최우선 보조 입력으로 사용한다.
+        # 최후 재판독 단계에서만 생성되므로 정상 건에는 비용이 없다.
+        screen_receipt = grayscale.crop(
+            (int(width * 0.10), int(height * 0.14), int(width * 0.99), int(height * 0.92))
+        )
+        screen_receipt = ImageOps.autocontrast(
+            screen_receipt.filter(ImageFilter.MedianFilter(3)), cutoff=1
+        )
+        screen_receipt = screen_receipt.resize(
+            (max(1, screen_receipt.width * 2), max(1, screen_receipt.height * 2)),
+            Image.Resampling.LANCZOS,
+        )
+        screen_output = BytesIO()
+        screen_receipt.save(screen_output, format="PNG")
+        payloads.append(screen_output.getvalue())
+
+        # The bands deliberately overlap: a receipt layout can put its date
+        # high in the body, while another puts the approval block near bottom.
+        for start, end in ((0.20, 0.57), (0.44, 0.76), (0.64, 0.92)):
+            band = grayscale.crop(
+                (int(width * 0.04), int(height * start), int(width * 0.97), int(height * end))
+            )
+            variants = (
+                band,
+                ImageEnhance.Contrast(ImageOps.autocontrast(band, cutoff=1)).enhance(2.2),
+            )
+            for variant in variants:
+                scale = min(5.0, 3600 / max(variant.width, variant.height))
+                enlarged = variant.resize(
+                    (max(1, round(variant.width * scale)), max(1, round(variant.height * scale))),
+                    Image.Resampling.LANCZOS,
+                )
+                output = BytesIO()
+                enlarged.save(output, format="PNG")
+                payloads.append(output.getvalue())
+        return tuple(payloads)
+
+
+def recognize_critical_transaction_details(
+    paths: tuple[Path, ...],
+    angle: int,
+    *,
+    deadline: float | None = None,
+    max_variants: int | None = None,
+) -> str:
+    """Read card-slip number fields after every regular OCR route has failed.
+
+    Callers must invoke this only for an ``이상`` result.  It must never add
+    latency to normal or 정상(2) receipts.
+    """
+    async def recognize_all() -> str:
+        texts: list[str] = []
+        attempted = 0
+        for path in paths:
+            for payload in _critical_transaction_detail_bytes(path, angle):
+                if _deadline_reached(deadline) or (
+                    max_variants is not None and attempted >= max_variants
+                ):
+                    return "\n".join(texts)
+                text = await _recognize_image_bytes_async(payload)
+                attempted += 1
+                if text:
+                    texts.append(text)
+        return "\n".join(texts)
+
+    return asyncio.run(recognize_all())
+
+
+def _pos_datetime_strip_bytes(path: Path, angle: int) -> tuple[bytes, ...]:
+    """Return the compact POS timestamp line from a photographed receipt.
+
+    This is intentionally a single, late-stage OCR input.  On some landscape
+    KICC receipts the date is printed immediately before ``POS`` but a full
+    receipt pass merges the thin digits into the background.  Keeping just
+    this line at readable scale preserves the date delimiter and adds no work
+    to normal receipts.
+    """
+    with Image.open(path) as source:
+        image = source.rotate(angle, expand=True) if angle else source.copy()
+        grayscale = image.convert("L")
+        width, height = grayscale.size
+        strip = grayscale.crop(
+            (int(width * 0.135), int(height * 0.418), int(width * 0.46), int(height * 0.47))
+        )
+        enlarged = strip.resize(
+            (max(1, strip.width * 5), max(1, strip.height * 5)),
+            Image.Resampling.LANCZOS,
+        )
+        output = BytesIO()
+        enlarged.save(output, format="PNG")
+        return (output.getvalue(),)
+
+
+def recognize_pos_datetime_strip(
+    paths: tuple[Path, ...],
+    angle: int,
+    *,
+    deadline: float | None = None,
+) -> str:
+    """Read the POS timestamp only after every ordinary OCR route failed."""
+    async def recognize_all() -> str:
+        texts: list[str] = []
+        for path in paths:
+            for payload in _pos_datetime_strip_bytes(path, angle):
+                if _deadline_reached(deadline):
+                    return "\n".join(texts)
                 text = await _recognize_image_bytes_async(payload)
                 if text:
                     texts.append(text)
@@ -301,6 +670,25 @@ def _one_digit_edit_away(expected: str, candidate: str) -> bool:
             return False
         candidate = candidate[:index] + candidate[index + 1 :]
     return True
+
+
+def _has_short_year_date_signature(transaction: UnsubmittedTransaction, text: str) -> bool:
+    """Recognize a complete date when only the leading ``20`` was lost by OCR.
+
+    This is deliberately *not* a general evidence-date match.  It is used
+    solely as an additional guard for the narrow card-payment approval-number
+    recovery below: exact month/day and the final two year digits must still
+    be present.  A bare ``26-09-14`` is therefore never enough to make a
+    receipt pass by itself.
+    """
+    year, month, day = transaction.evidence_date.split("-")
+    repaired = text.translate(str.maketrans({"니": "1", "이": "9"}))
+    year_pattern = rf"(?:{re.escape(year)}|{re.escape(year[-2:])})"
+    pattern = (
+        rf"(?<!\d){year_pattern}\D{{0,6}}0?{int(month)}"
+        rf"\D{{0,6}}0?{int(day)}(?!\d)"
+    )
+    return bool(re.search(pattern, repaired))
 
 
 def _approval_check(transaction: UnsubmittedTransaction, text: str, tokens: tuple[str, ...]) -> ReceiptFieldCheck:
@@ -423,6 +811,33 @@ def _approval_check(transaction: UnsubmittedTransaction, text: str, tokens: tupl
             is_match=True,
             reason="승인 문맥의 한 자리 OCR 보정 일치",
         )
+
+    # 사진형 카드전표의 하단은 숫자 한 글자가 틀어지는 경우가 있다. 이 보정은
+    # 카드/결제 문맥 안에서 (1) 화면 금액이 정확히 같이 읽히고, (2) 해당 영수증의
+    # 연도 끝 두 자리·월·일도 모두 남아 있을 때에만 허용한다. 즉 ``26-09-니4``
+    # 자체를 날짜 일치로 완화하지 않으며, 잘못 첨부된 다른 영수증을 한 자리
+    # 승인번호 오인만으로 통과시키지 않는다.
+    expected_amount = str(int(transaction.amount))
+    card_payment_contexts = re.findall(
+        r".{0,72}(?:[카가]드|결제|KIC[,. ]?C|VAN).{0,120}",
+        text,
+        flags=re.IGNORECASE | re.DOTALL,
+    )
+    if _has_short_year_date_signature(transaction, text):
+        for context in card_payment_contexts:
+            if expected_amount not in _numeric_tokens(context):
+                continue
+            for candidate in _numeric_tokens(context):
+                if len(candidate) != len(expected):
+                    continue
+                if _one_digit_edit_away(expected, candidate):
+                    return ReceiptFieldCheck(
+                        field_name="승인번호",
+                        expected_value=expected,
+                        detected_value=candidate,
+                        is_match=True,
+                        reason="카드결제·금액·날짜 문맥의 한 자리 OCR 보정 일치",
+                    )
     return exact
 
 
@@ -431,7 +846,18 @@ def _date_check(transaction: UnsubmittedTransaction, text: str, tokens: tuple[st
     # 2026년 08월20일, 2026-08-20, 2026기820처럼 구분자가 깨진 형식도 허용한다.
     # (,)처럼 흐린 0이 기호 둘로 분리되는 OCR 사례도 날짜 문맥에서만 보정한다.
     date_text = text.translate(
-        str.maketrans({"O": "0", "o": "0", "Z": "2", "z": "2", "b": "6", "f": "6", "F": "6"})
+        str.maketrans(
+            {
+                "O": "0", "o": "0", "Z": "2", "z": "2", "b": "6", "f": "6", "F": "6",
+                # 모니터 촬영 영수증에서 9가 한글 '이'로 읽힌 사례:
+                # 2026.09.09 -> 2026.0이09. 전체 날짜 패턴이 일치할 때만
+                # 인정되므로 이 보정만으로 임의 날짜를 통과시키지는 않는다.
+                "이": "9",
+                # 감열지의 9가 '누'로 인식된 사례. 아래의 전체 날짜 또는
+                # POS 문맥의 월·일 일치 조건을 모두 통과할 때만 사용한다.
+                "누": "9",
+            }
+        )
     )
     date_text = date_text.replace("()", "0").replace(",)", "0").replace("(,", "0")
     pattern = rf"{year}\D{{0,5}}0?{int(month)}\D{{0,5}}0?{int(day)}"
@@ -530,6 +956,9 @@ def recognize_images_until(
     paths: tuple[Path, ...],
     angle: int,
     base_text: str = "",
+    *,
+    deadline: float | None = None,
+    max_variants: int | None = None,
 ) -> tuple[str, ReceiptValidationResult]:
     """Read enhanced variants one by one, stopping as soon as all fields match.
 
@@ -542,9 +971,15 @@ def recognize_images_until(
     texts: list[str] = [base_text] if base_text else []
 
     async def run() -> str:
+        attempted = 0
         for path in paths:
             for payload in _enhanced_region_bytes(path, angle, ((0.05, 0.48), (0.45, 1.0))):
+                if _deadline_reached(deadline) or (
+                    max_variants is not None and attempted >= max_variants
+                ):
+                    return "\n".join(texts)
                 text = await _recognize_image_bytes_async(payload)
+                attempted += 1
                 if not text:
                     continue
                 texts.append(text)
@@ -573,133 +1008,240 @@ def validate_receipt_images(
     image_paths: tuple[Path, ...],
 ) -> ReceiptValidationResult:
     candidates: list[tuple[int, ReceiptValidationResult]] = []
-    
-    # 실측 표본에서 가로로 긴 파일은 전부 270° 회전 저장본, 세로로 긴 파일은
-    # 전부 정방향이었다. 파일 크기만 읽어 첫 판독 각도를 정한다(OCR 비용 0).
-    first_angle = 0
-    if image_paths:
-        try:
-            with Image.open(image_paths[0]) as probe:
-                if probe.width > probe.height:
-                    first_angle = 270
-        except (OSError, ValueError):
-            first_angle = 0
-    second_angle = 270 if first_angle == 0 else 0
+    # 이 시각부터는 정상 판정에 실패한 한 건 전체가 공유하는 보조 OCR 시간
+    # 예산이다. 정상 건은 첫 OCR에서 바로 반환하므로 이 제한의 영향을 받지 않는다.
+    failure_retry_deadline = time.monotonic() + _FAILURE_RETRY_BUDGET_SECONDS
 
-   # 승인번호가 주로 하단 카드결제 영역에 있는 사진은 이 단독 판독이 가장 안정적이다.
-    focused_bottom_text = recognize_focused_bottom(image_paths, 0)
+    def is_eligible(result: ReceiptValidationResult) -> bool:
+        return result.status in {"정상", "정상(2)"}
+
+    # 가장 빠른 원본 전체 OCR을 먼저 실행한다. 통과하면 아래의 사진 보조 OCR은
+    # 전혀 실행하지 않는다.
     upright_text = recognize_images(image_paths, 0)
     if upright_text.strip():
-        upright = evaluate_ocr_text(transaction, upright_text)
+        upright = replace(
+            evaluate_ocr_text(transaction, upright_text),
+            account_validation_text=upright_text,
+        )
         candidates.append((0, upright))
-        # 이미 세 필드가 모두 일치하면 불필요한 세 번의 OCR을 생략한다.
-        if upright.status == "정상":
+        # 정상(2)도 자동 결재 가능한 판정이다. 더 많은 OCR을 실행해 세 번째
+        # 필드를 찾으려다 정상 행의 속도를 늦추지 않는다.
+        if is_eligible(upright):
             return upright
+
+    # 모니터를 촬영한 승인전표는 화면 주사선·기울어짐 때문에 Windows OCR이
+    # 숫자만 깨뜨릴 수 있다. 기본 OCR 실패 건에만 먼저 한국어 보조 OCR을 적용해
+    # 일반 보조 OCR이 시간 예산을 모두 쓰기 전에 이 유형을 복구한다.
+    monitor_photo_text = recognize_monitor_photo(image_paths)
+    if monitor_photo_text.strip():
+        monitor_photo = replace(
+            evaluate_ocr_text(
+                transaction,
+                "\n".join(filter(None, (upright_text, monitor_photo_text))),
+            ),
+            account_validation_text=upright_text,
+        )
+        candidates.append((0, monitor_photo))
+        if is_eligible(monitor_photo):
+            return monitor_photo
+
+    # 승인번호가 주로 하단 카드결제 영역에 있는 사진은 이 단독 판독이 가장 안정적이다.
+    focused_bottom_text = recognize_focused_bottom(
+        image_paths,
+        0,
+        deadline=failure_retry_deadline,
+    )
     if focused_bottom_text.strip():
-        focused = evaluate_ocr_text(
-            transaction,
-            "\n".join(filter(None, (upright_text, focused_bottom_text))),
+        focused = replace(
+            evaluate_ocr_text(
+                transaction,
+                "\n".join(filter(None, (upright_text, focused_bottom_text))),
+            ),
+            account_validation_text=upright_text,
         )
         candidates.append((0, focused))
-        if focused.status == "정상":
+        if is_eligible(focused):
             return focused
 
     # 사진형 영수증의 카드결제 구간은 좁은 줄 단위로 한 번 더 읽는다. 이 보조 판독은
     # 승인번호를 명확히 읽을 수 있을 때만 이후의 정확 일치 검증을 통과한다.
-    approval_line_text = recognize_approval_lines(image_paths, 0)
+    approval_line_text = recognize_approval_lines(
+        image_paths,
+        0,
+        deadline=failure_retry_deadline,
+    )
     if approval_line_text.strip():
-        approval_lines = evaluate_ocr_text(
-            transaction,
-            "\n".join(filter(None, (upright_text, focused_bottom_text, approval_line_text))),
+        approval_lines = replace(
+            evaluate_ocr_text(
+                transaction,
+                "\n".join(filter(None, (upright_text, focused_bottom_text, approval_line_text))),
+            ),
+            account_validation_text=upright_text,
         )
         candidates.append((0, approval_lines))
-        if approval_lines.status == "정상":
+        if is_eligible(approval_lines):
             return approval_lines
 
-    # 실측 표본에서 회전 저장본은 전부 270°였다. 180°는 3단계 최후 시도로 미룬다.
+    # 가로 저장 또는 옆으로 촬영된 영수증만 회전 기본 OCR을 시도한다.
     for angle in (270, 90):
+        if _deadline_reached(failure_retry_deadline):
+            break
         text = recognize_images(image_paths, angle)
         if not text.strip():
             continue
-        rotated = evaluate_ocr_text(transaction, text)
+        rotated = replace(
+            evaluate_ocr_text(transaction, text),
+            account_validation_text=text,
+        )
         candidates.append((angle, rotated))
-        # 1단계 upright/focused와 같은 조기 반환 규칙. 여기서 끝나면 3단계 27회×n을 아예 건너뛴다.
-        if rotated.status == "정상":
-            return ReceiptValidationResult(
-                transaction_id=rotated.transaction_id,
-                status=rotated.status,
-                checks=rotated.checks,
-                ocr_text=rotated.ocr_text,
+        if is_eligible(rotated):
+            return replace(
+                rotated,
                 rotation_degrees=angle,
                 orientation_ambiguous=False,
                 orientation_reason="",
             )
-    if not candidates:
-        raise OcrUnavailableError("영수증에서 텍스트를 읽지 못했습니다.")
 
-
-    # 사진은 정방향인데 회전 OCR이 우연히 숫자를 많이 읽어 잘못 선택되는 사례가 있다.
-    # 반대로 세로·거꾸로 저장된 영수증은 기본 OCR의 점수가 낮아 강화 판독 후보에서
-    # 빠지는 경우도 있다. 이상 건에 한해 네 방향 모두를 강화 판독해 필드 일치 수로
-    # 최종 선택한다. 원본 파일은 전혀 수정하지 않는다.
-    base_by_angle = {angle: result for angle, result in candidates}
-    enhancement_angles = (270, 0, 90)
-    enhanced_candidates: list[tuple[int, ReceiptValidationResult]] = []
-    for angle in enhancement_angles:
-        base = base_by_angle.get(angle)
-        try:
-            merged_text, merged = recognize_images_until(
+        # 정상 영수증은 위의 전체 OCR에서 바로 반환한다. 금액만 확인된 실패 건에
+        # 한해서만 같은 회전 방향의 결제정보 영역을 네 가지 대비로 재판독한다.
+        # 따라서 일반적인 정상 건에는 추가 OCR 호출이나 처리 지연이 없다.
+        amount_matched = any(
+            check.field_name == "사용금액" and check.is_match
+            for check in rotated.checks
+        )
+        if not amount_matched:
+            continue
+        payment_detail_text = recognize_payment_details(
+            image_paths,
+            angle,
+            deadline=failure_retry_deadline,
+        )
+        if not payment_detail_text.strip():
+            continue
+        payment_detail = replace(
+            evaluate_ocr_text(
                 transaction,
-                image_paths,
-                angle,
-                base.ocr_text if base else "",
-            )
-        except (OSError, ValueError):
-            continue
-        if not merged_text.strip():
-            continue
-        enhanced_candidates.append((angle, merged))
-        # 강화 판독은 한 방향이 최대 OCR 27회다. 정상 판정이 나온 뒤에도 남은
-        # 방향을 계속 돌면 정방향 영수증에서 81회가 순수 낭비된다. 앞의
-        # upright·focused·approval_lines 단계와 같은 조기 반환 규칙을 적용한다.
-        if merged.status == "정상":
-            return ReceiptValidationResult(
-                transaction_id=merged.transaction_id,
-                status=merged.status,
-                checks=merged.checks,
-                ocr_text=merged.ocr_text,
+                "\n".join(filter(None, (text, payment_detail_text))),
+            ),
+            account_validation_text=text,
+        )
+        candidates.append((angle, payment_detail))
+        if is_eligible(payment_detail):
+            return replace(
+                payment_detail,
                 rotation_degrees=angle,
                 orientation_ambiguous=False,
                 orientation_reason="",
             )
-
-    # 여기 도달했다는 건 세 방향 모두 정상이 아니라는 뜻이다. 거꾸로 저장된
-    # 영수증만 남으므로 강화 판독 27회 대신 기본 OCR 1회로 안전망을 남긴다.
+    # 뒤집힌 사진은 한 번만 확인한다. 과거처럼 세 방향 각각 수십 장을 강화 OCR
+    # 하지 않으므로, 판독할 수 없는 영수증 한 건이 다음 행을 오래 막지 않는다.
     try:
-        flipped_text = recognize_images(image_paths, 180)
+        flipped_text = (
+            recognize_images(image_paths, 180)
+            if not _deadline_reached(failure_retry_deadline)
+            else ""
+        )
     except (OSError, ValueError):
         flipped_text = ""
     if flipped_text.strip():
-        flipped = evaluate_ocr_text(transaction, flipped_text)
+        flipped = replace(
+            evaluate_ocr_text(transaction, flipped_text),
+            account_validation_text=flipped_text,
+        )
         candidates.append((180, flipped))
-        if flipped.status == "정상":
-            return ReceiptValidationResult(
-                transaction_id=flipped.transaction_id,
-                status=flipped.status,
-                checks=flipped.checks,
-                ocr_text=flipped.ocr_text,
+        if is_eligible(flipped):
+            return replace(
+                flipped,
                 rotation_degrees=180,
                 orientation_ambiguous=False,
                 orientation_reason="",
             )
 
+    if not candidates:
+        raise OcrUnavailableError("영수증에서 텍스트를 읽지 못했습니다.")
 
-
-    final_candidates = [*candidates, *enhanced_candidates]
-    ranked = sorted(final_candidates, key=lambda item: _orientation_score(item[1]), reverse=True)
+    ranked = sorted(candidates, key=lambda item: _orientation_score(item[1]), reverse=True)
     best_angle, best = ranked[0]
+
+    # 여기부터는 기본 OCR이 통과하지 못한 예외 후보에만 적용하는 최대 15초
+    # 보조 경로다. 작은 웹 영수증·모니터 촬영본은 원본 해상도로 읽으면 승인번호
+    # 획이 사라지므로, 먼저 전체 문서를 확대·선명화한 입력을 사용한다.
+    screen_text = recognize_screen_capture(
+        image_paths,
+        best_angle,
+        deadline=failure_retry_deadline,
+    )
+    if screen_text.strip():
+        screen = replace(
+            evaluate_ocr_text(
+                transaction,
+                "\n".join(filter(None, (best.ocr_text, screen_text))),
+            ),
+            account_validation_text=best.account_validation_text,
+        )
+        candidates.append((best_angle, screen))
+        if is_eligible(screen):
+            return replace(
+                screen,
+                rotation_degrees=best_angle,
+                orientation_ambiguous=False,
+                orientation_reason="",
+            )
+        best = screen
+
+    # 화면 캡처 보정 뒤에도 사용금액 자체가 보이지 않으면, 마지막 숫자영역
+    # 재판독은 세 장으로 제한한다. 금액이 보인 건만 전체 좁은 영역을 시도한다.
+    amount_matched = any(
+        check.field_name == "사용금액" and check.is_match for check in best.checks
+    )
+    if best.status == "이상":
+        critical_text = recognize_critical_transaction_details(
+            image_paths,
+            best_angle,
+            deadline=failure_retry_deadline,
+            max_variants=None if amount_matched else 3,
+        )
+        if critical_text.strip():
+            critical = evaluate_ocr_text(
+                transaction,
+                "\n".join(filter(None, (best.ocr_text, critical_text))),
+            )
+            if is_eligible(critical):
+                return replace(
+                    critical,
+                    account_validation_text=best.account_validation_text,
+                    rotation_degrees=best_angle,
+                    orientation_ambiguous=False,
+                    orientation_reason="",
+                )
+
+        # 마지막으로 POS 시각행 하나만 크게 읽는다. 앞 단계와 같은 제한 시간
+        # 안에서만 실행되므로 실패 건의 전체 처리 시간은 통제된다.
+        pos_datetime_text = ""
+        if amount_matched and not _deadline_reached(failure_retry_deadline):
+            pos_datetime_text = recognize_pos_datetime_strip(
+                image_paths,
+                best_angle,
+                deadline=failure_retry_deadline,
+            )
+        if pos_datetime_text.strip():
+            pos_datetime = evaluate_ocr_text(
+                transaction,
+                "\n".join(filter(None, (best.ocr_text, critical_text, pos_datetime_text))),
+            )
+            if is_eligible(pos_datetime):
+                return replace(
+                    pos_datetime,
+                    account_validation_text=best.account_validation_text,
+                    rotation_degrees=best_angle,
+                    orientation_ambiguous=False,
+                    orientation_reason="",
+                )
+
+    final_ranked = sorted(candidates, key=lambda item: _orientation_score(item[1]), reverse=True)
+    best_angle, best = final_ranked[0]
     best_score = _orientation_score(best)
-    tied_angles = [angle for angle, result in ranked if _orientation_score(result) == best_score]
+    tied_angles = [angle for angle, result in final_ranked if _orientation_score(result) == best_score]
     ambiguous = len(tied_angles) > 1
     reason = ""
     if ambiguous:
@@ -709,6 +1251,7 @@ def validate_receipt_images(
         status="이상" if ambiguous else best.status,
         checks=best.checks,
         ocr_text=best.ocr_text,
+        account_validation_text=best.account_validation_text,
         rotation_degrees=best_angle,
         orientation_ambiguous=ambiguous,
         orientation_reason=reason,

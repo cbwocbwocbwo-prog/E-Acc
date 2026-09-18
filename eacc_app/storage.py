@@ -5,10 +5,12 @@ import json
 import sqlite3
 from contextlib import contextmanager
 from datetime import datetime
+from decimal import Decimal
 from pathlib import Path
-from typing import Iterator
+from typing import Iterable, Iterator
 
 from .models import (
+    ExceptionMailUse,
     ImportDisplayRow,
     ImportHistoryItem,
     ImportSummary,
@@ -81,6 +83,7 @@ CREATE TABLE IF NOT EXISTS mail_delivery_logs (
     reason TEXT NOT NULL DEFAULT '',
     transaction_ids_json TEXT NOT NULL DEFAULT '[]'
     ,outlook_message_id TEXT NOT NULL DEFAULT ''
+    ,mail_batch_id TEXT NOT NULL DEFAULT ''
 );
 
 CREATE INDEX IF NOT EXISTS idx_mail_delivery_logs_status
@@ -130,6 +133,10 @@ class ImportRepository:
             if "outlook_message_id" not in mail_columns:
                 connection.execute(
                     "ALTER TABLE mail_delivery_logs ADD COLUMN outlook_message_id TEXT NOT NULL DEFAULT ''"
+                )
+            if "mail_batch_id" not in mail_columns:
+                connection.execute(
+                    "ALTER TABLE mail_delivery_logs ADD COLUMN mail_batch_id TEXT NOT NULL DEFAULT ''"
                 )
             # Earlier builds called Outlook.Send() and immediately wrote
             # '발송 완료'.  That only proves the item entered Outlook, not that
@@ -292,10 +299,10 @@ class ImportRepository:
         transaction: UnsubmittedTransaction,
         status: str,
         reason: str = "",
-        outlook_message_id: str = "",
     ) -> ProcessingEvent:
         event_at = datetime.now().astimezone().isoformat(timespec="seconds")
         with self._connection() as connection:
+            self._upsert_transaction_snapshot(connection, transaction, event_at)
             cursor = connection.execute(
                 """
                 INSERT INTO processing_events(
@@ -327,6 +334,39 @@ class ImportRepository:
             status=status,
             reason=reason,
             account_name=transaction.account_name,
+        )
+
+    def store_transaction_snapshots(
+        self,
+        transactions: Iterable[UnsubmittedTransaction],
+    ) -> None:
+        """Persist rows already read from e-Acc for later result display.
+
+        This only writes the grid data already in memory.  It deliberately
+        does not initiate an additional browser request or receipt OCR pass.
+        """
+        snapshots = tuple(transactions)
+        if not snapshots:
+            return
+        stored_at = datetime.now().astimezone().isoformat(timespec="seconds")
+        with self._connection() as connection:
+            for transaction in snapshots:
+                self._upsert_transaction_snapshot(connection, transaction, stored_at)
+
+    @staticmethod
+    def _upsert_transaction_snapshot(connection, transaction: UnsubmittedTransaction, stored_at: str) -> None:
+        connection.execute(
+            """
+            INSERT INTO transactions(transaction_key, transaction_id, first_seen_at, source_data_json)
+            VALUES (?, ?, ?, ?)
+            ON CONFLICT(transaction_id) DO UPDATE SET source_data_json = excluded.source_data_json
+            """,
+            (
+                transaction.transaction_key,
+                transaction.transaction_id,
+                stored_at,
+                json.dumps(transaction.to_json_dict(), ensure_ascii=False),
+            ),
         )
 
     def recent_processing_events(self, limit: int = 500) -> tuple[ProcessingEvent, ...]:
@@ -389,6 +429,91 @@ class ImportRepository:
             ).fetchall()
         return {str(row["transaction_id"]): str(row["status"]) for row in rows}
 
+    def transaction_cost_centers(self, transaction_ids: Iterable[str]) -> dict[str, str]:
+        """Return the original cost center for displayed processing rows."""
+        identifiers = tuple(dict.fromkeys(str(value) for value in transaction_ids if str(value)))
+        if not identifiers:
+            return {}
+        placeholders = ", ".join("?" for _ in identifiers)
+        with self._connection() as connection:
+            rows = connection.execute(
+                f"SELECT transaction_id, source_data_json FROM transactions WHERE transaction_id IN ({placeholders})",
+                identifiers,
+            ).fetchall()
+        result: dict[str, str] = {}
+        for row in rows:
+            try:
+                result[str(row["transaction_id"])] = str(
+                    json.loads(row["source_data_json"]).get("cost_center", "")
+                ).strip()
+            except (TypeError, ValueError, json.JSONDecodeError):
+                continue
+        return result
+
+    def today_exception_mail_uses(self, process_date: str | None = None) -> tuple[ExceptionMailUse, ...]:
+        """Return today's final exceptions that have a usable receipt.
+
+        The processing-event table deliberately stores a compact audit trail;
+        cost center and evidence status are recovered from the original
+        transaction snapshot.  Selecting only the final terminal state keeps
+        a transaction that was later corrected from being emailed as an
+        exception.
+        """
+        target_date = process_date or datetime.now().astimezone().date().isoformat()
+        with self._connection() as connection:
+            rows = connection.execute(
+                """
+                SELECT terminal.transaction_id, terminal.approval_number,
+                       terminal.evidence_date, terminal.amount, terminal.merchant,
+                       terminal.reason, source_transaction.source_data_json,
+                       (
+                           SELECT receipt.status
+                           FROM processing_events AS receipt
+                           WHERE receipt.transaction_id = terminal.transaction_id
+                             AND receipt.status LIKE '영수증 %'
+                           ORDER BY receipt.id DESC LIMIT 1
+                       ) AS receipt_status
+                FROM processing_events AS terminal
+                INNER JOIN (
+                    SELECT transaction_id, MAX(id) AS latest_id
+                    FROM processing_events
+                    WHERE substr(event_at, 1, 10) = ?
+                      AND status IN ('처리 완료', '예외처리')
+                    GROUP BY transaction_id
+                ) AS latest ON latest.latest_id = terminal.id
+                INNER JOIN transactions AS source_transaction
+                    ON source_transaction.transaction_id = terminal.transaction_id
+                WHERE terminal.status = '예외처리'
+                ORDER BY terminal.id
+                """,
+                (target_date,),
+            ).fetchall()
+        result: list[ExceptionMailUse] = []
+        for row in rows:
+            try:
+                source = json.loads(row["source_data_json"])
+            except (TypeError, ValueError, json.JSONDecodeError):
+                continue
+            # Missing/synchronising receipts must never generate a team mail.
+            if str(source.get("evidence_status", "")).strip() != "#":
+                continue
+            if str(row["receipt_status"] or "").strip() == "영수증 재조회 필요":
+                continue
+            cost_center = str(source.get("cost_center", "")).strip()
+            if not cost_center:
+                continue
+            try:
+                amount = Decimal(str(row["amount"]).replace(",", ""))
+            except (ValueError, ArithmeticError):
+                continue
+            result.append(ExceptionMailUse(
+                transaction_id=str(row["transaction_id"]), cost_center=cost_center,
+                card_holder=str(source.get("card_holder", "")),
+                approval_number=str(row["approval_number"]), evidence_date=str(row["evidence_date"]),
+                merchant=str(row["merchant"]), amount=amount, reason=str(row["reason"]),
+            ))
+        return tuple(result)
+
     def record_mail_log(
         self,
         *,
@@ -400,6 +525,7 @@ class ImportRepository:
         status: str,
         reason: str = "",
         outlook_message_id: str = "",
+        mail_batch_id: str = "",
     ) -> MailLogItem:
         sent_at = datetime.now().astimezone().isoformat(timespec="seconds")
         logged_email = _mask_email(recipient_email)
@@ -408,14 +534,14 @@ class ImportRepository:
                 """
                 INSERT INTO mail_delivery_logs(
                     sent_at, recipient_name, recipient_email, department,
-                    transaction_count, subject, status, reason, transaction_ids_json, outlook_message_id
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    transaction_count, subject, status, reason, transaction_ids_json, outlook_message_id, mail_batch_id
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     sent_at, recipient_name, logged_email, department,
                     len(transaction_ids), subject, status, reason,
                     json.dumps(transaction_ids, ensure_ascii=False),
-                    outlook_message_id,
+                    outlook_message_id, mail_batch_id,
                 ),
             )
             log_id = int(cursor.lastrowid)
@@ -424,7 +550,7 @@ class ImportRepository:
             recipient_email=logged_email, department=department,
             transaction_count=len(transaction_ids), subject=subject,
             status=status, reason=reason, transaction_ids=transaction_ids,
-            outlook_message_id=outlook_message_id,
+            outlook_message_id=outlook_message_id, mail_batch_id=mail_batch_id,
         )
 
     def recent_mail_logs(self, limit: int = 500) -> tuple[MailLogItem, ...]:
@@ -432,7 +558,7 @@ class ImportRepository:
             rows = connection.execute(
                 """
                 SELECT id, sent_at, recipient_name, recipient_email, department,
-                       transaction_count, subject, status, reason, transaction_ids_json, outlook_message_id
+                       transaction_count, subject, status, reason, transaction_ids_json, outlook_message_id, mail_batch_id
                 FROM mail_delivery_logs ORDER BY id DESC LIMIT ?
                 """,
                 (limit,),
@@ -449,7 +575,7 @@ class ImportRepository:
                 department=row["department"], transaction_count=row["transaction_count"],
                 subject=row["subject"], status=row["status"], reason=row["reason"],
                 transaction_ids=transaction_ids,
-                outlook_message_id=row["outlook_message_id"],
+                outlook_message_id=row["outlook_message_id"], mail_batch_id=row["mail_batch_id"],
             ))
         return tuple(result)
 

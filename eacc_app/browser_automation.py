@@ -123,6 +123,11 @@ class CurrentEAccTarget:
     row_number: int
     total_row_count: int
     grid_row_id: str
+    # The visible e-Acc rows are already read from the grid while choosing
+    # the first target.  Returning their parsed snapshots lets the UI retain
+    # cost-center information for its result history without another browser
+    # query or any OCR work.
+    visible_transactions: tuple[UnsubmittedTransaction, ...] = ()
 
 
 @dataclass(frozen=True, slots=True)
@@ -133,6 +138,9 @@ class ActualMerchantPreparation:
     row_number: int
     total_row_count: int
     grid_row_id: str
+    # 기존 실구매처와 영수증·비즈노 검증값이 달라 사용자에게 덮어쓰기 여부를
+    # 확인해야 하는지 UI에 전달한다.
+    overwriting_existing: bool = False
 
 
 @dataclass(frozen=True, slots=True)
@@ -195,7 +203,7 @@ class _SubmitActualMerchantRegistrationCommand:
 
 @dataclass(frozen=True, slots=True)
 class _ResetActualMerchantRegistrationCommand:
-    """Clear a declined real-merchant popup and accept its confirmation alerts."""
+    """Close a declined real-merchant popup without changing the saved value."""
 
     transaction: UnsubmittedTransaction
     on_success: Callable[[str], None]
@@ -374,7 +382,7 @@ class EAccountingBrowserService:
         on_success: Callable[[str], None],
         on_error: Callable[[Exception], None],
     ) -> None:
-        """Clear a user-declined popup before continuing with the next row."""
+        """Close a user-declined popup before continuing with the next row."""
         self._commands.put(
             _ResetActualMerchantRegistrationCommand(transaction, on_success, on_error)
         )
@@ -1057,25 +1065,7 @@ class EAccountingBrowserService:
         self._open_unsubmitted_menu(page)
         main_frame = self._wait_for_frame(page, "mainFrame")
 
-        card_select = main_frame.locator("select#CARD_NO")
-        card_select.wait_for(state="visible", timeout=15_000)
-        card_select.select_option(value="C")
-        main_frame.evaluate(
-            """
-            () => {
-                window.__eaccQueryDone = false;
-                GridObj.attachEvent('onXLE', () => {
-                    window.__eaccQueryDone = true;
-                    return true;
-                });
-                doQuery();
-            }
-            """
-        )
-        main_frame.wait_for_function(
-            "() => window.__eaccQueryDone === true",
-            timeout=20_000,
-        )
+        self._query_unsubmitted(main_frame)
         main_frame.get_by_text("총 :", exact=False).first.wait_for(state="visible", timeout=20_000)
         row_count = int(main_frame.evaluate("() => GridObj.getRowsNum()") or 0)
         if row_count == 0:
@@ -1149,6 +1139,8 @@ class EAccountingBrowserService:
         )
         if not grid_rows:
             raise BrowserAutomationError("e-Acc 검색 결과의 첫 행을 읽지 못했습니다.")
+        visible_transactions: list[UnsubmittedTransaction] = []
+        visible_locations: list[_GridRowLocation] = []
         for source_row_number, grid_row in enumerate(grid_rows["rows"], start=1):
             try:
                 transaction = transaction_from_grid_row(
@@ -1160,12 +1152,19 @@ class EAccountingBrowserService:
                 raise BrowserAutomationError(
                     f"e-Acc {source_row_number}번째 행 형식을 해석하지 못했습니다: {exc}"
                 ) from exc
+            visible_transactions.append(transaction)
+            visible_locations.append(_GridRowLocation(
+                row_id=str(grid_row["rowId"]), row_number=source_row_number,
+                total_row_count=len(grid_rows["rows"]),
+            ))
+        for transaction, location in zip(visible_transactions, visible_locations):
             if transaction.transaction_id not in excluded_transaction_ids:
                 return CurrentEAccTarget(
                     transaction=transaction,
-                    row_number=source_row_number,
-                    total_row_count=len(grid_rows["rows"]),
-                    grid_row_id=str(grid_row["rowId"]),
+                    row_number=location.row_number,
+                    total_row_count=location.total_row_count,
+                    grid_row_id=location.row_id,
+                    visible_transactions=tuple(visible_transactions),
                 )
         raise NoEligibleTransactions(
             "미상신내역은 남아 있으나, 이번 실행에서 예외처리한 행 외에는 처리 가능 행이 없습니다."
@@ -1179,6 +1178,7 @@ class EAccountingBrowserService:
         self._open_card_processing_top_menu(page)
         self._open_unprocessed_card_menu(page)
         main_frame = self._wait_for_frame(page, "mainFrame")
+        # 미처리내역 화면의 검색 조건은 e-Acc의 기본값 그대로 사용한다.
         self._query_unsubmitted(main_frame)
         grid = main_frame.evaluate(
             """
@@ -1222,26 +1222,7 @@ class EAccountingBrowserService:
         if main_frame.evaluate("() => GridObj.getRowsNum()") == 0:
             self._query_unsubmitted(main_frame)
 
-        matches = main_frame.evaluate(
-            r"""
-            target => {
-                const digits = value => String(value ?? '').replace(/\D/g, '');
-                const amount = value => String(value ?? '').replace(/[^0-9-]/g, '');
-                return GridObj.getAllRowIds().split(',').filter(Boolean).filter(rowId =>
-                    String(GridObj.cells(rowId, GridObj.getColIndexById('CARD_NO')).getValue()) === target.cardNumber &&
-                    String(GridObj.cells(rowId, GridObj.getColIndexById('APPR_NO')).getValue()) === target.approvalNumber &&
-                    digits(GridObj.cells(rowId, GridObj.getColIndexById('BLDAT')).getValue()) === target.evidenceDate &&
-                    amount(GridObj.cells(rowId, GridObj.getColIndexById('USED_AMT')).getValue()) === target.amount
-                );
-            }
-            """,
-            {
-                "cardNumber": transaction.card_number,
-                "approvalNumber": transaction.approval_number,
-                "evidenceDate": transaction.evidence_date.replace("-", ""),
-                "amount": str(transaction.amount),
-            },
-        )
+        matches = self._matching_receipt_row_ids(main_frame, transaction)
         if len(matches) != 1:
             raise BrowserAutomationError(
                 f"선택 거래와 일치하는 웹 화면 행이 {len(matches)}건입니다. 영수증을 안전하게 연결할 수 없습니다."
@@ -1249,8 +1230,25 @@ class EAccountingBrowserService:
 
         row_id = matches[0]
         popup = None
-        popup_windows_before = self._edge_popup_window_handles()
         try:
+            # 증빙유무 확인과 영수증 OCR 사이에 전표 상세를 한 번 저장한다.
+            # e-Acc는 행을 더블클릭할 때만 slip_mgt 창을 열므로, 행 번호 대신
+            # 앞에서 카드·승인번호·일자·금액으로 확정한 기술 행 ID를 사용한다.
+            self._save_slip_before_receipt_download(page, main_frame, row_id)
+
+            # 전표상세 저장은 미상신내역 행을 비동기로 다시 그린다. 저장 전
+            # row_id를 그대로 쓰면 결재선 창을 열기 전에 실패하므로, 목록을
+            # 다시 검색하고 같은 거래를 다시 찾아 새 row_id를 사용한다.
+            self._query_unsubmitted(main_frame)
+            matches = self._matching_receipt_row_ids(main_frame, transaction)
+            if len(matches) != 1:
+                raise BrowserAutomationError(
+                    f"전표 상세 저장 후 선택 거래와 일치하는 웹 화면 행이 {len(matches)}건입니다. "
+                    "영수증을 안전하게 연결할 수 없습니다."
+                )
+            row_id = matches[0]
+            popup_windows_before = self._edge_popup_window_handles()
+
             # 이름이 같은 이전 결재선 창은 새 선택 행과 섞이지 않도록 닫는다.
             for candidate in tuple(context.pages):
                 if "approval_set_list_popup.jsp" in candidate.url:
@@ -1328,6 +1326,135 @@ class EAccountingBrowserService:
             if popup is not None and not popup.is_closed():
                 popup.close()
 
+    @staticmethod
+    def _matching_receipt_row_ids(
+        main_frame,
+        transaction: UnsubmittedTransaction,
+    ) -> list[str]:
+        """Return exact e-Acc row IDs suitable for the receipt-popup action."""
+        return main_frame.evaluate(
+            r"""
+            target => {
+                const digits = value => String(value ?? '').replace(/\D/g, '');
+                const amount = value => String(value ?? '').replace(/[^0-9-]/g, '');
+                return GridObj.getAllRowIds().split(',').filter(Boolean).filter(rowId =>
+                    String(GridObj.cells(rowId, GridObj.getColIndexById('CARD_NO')).getValue()) === target.cardNumber &&
+                    String(GridObj.cells(rowId, GridObj.getColIndexById('APPR_NO')).getValue()) === target.approvalNumber &&
+                    digits(GridObj.cells(rowId, GridObj.getColIndexById('BLDAT')).getValue()) === target.evidenceDate &&
+                    amount(GridObj.cells(rowId, GridObj.getColIndexById('USED_AMT')).getValue()) === target.amount
+                );
+            }
+            """,
+            {
+                "cardNumber": transaction.card_number,
+                "approvalNumber": transaction.approval_number,
+                "evidenceDate": transaction.evidence_date.replace("-", ""),
+                "amount": str(transaction.amount),
+            },
+        )
+
+    @staticmethod
+    def _save_slip_before_receipt_download(page, main_frame, row_id: str) -> None:
+        """Open one slip detail, save it, and close it before receipt OCR.
+
+        The save-success browser alert is optional: it is accepted when e-Acc
+        emits it, but its absence never delays the receipt workflow.  Any other
+        alert is treated as a save failure rather than silently accepted.
+        """
+        slip_popup = None
+        unexpected_dialogs: list[str] = []
+        target_token = f"eacc-slip-save-{row_id}"
+
+        try:
+            # e-Acc의 DHTMLX Grid는 화면에 보이는 <tr> id가 기술 rowId와 항상
+            # 같지 않다. GridObj로 승인번호 셀을 직접 얻어 표시용 표식을 붙인
+            # 뒤, Playwright가 바로 그 실제 셀에 사람과 같은 더블클릭을 보낸다.
+            prepared_cell = main_frame.evaluate(
+                """
+                target => {
+                    const approvalColumn = GridObj.getColIndexById('APPR_NO');
+                    if (approvalColumn < 0) {
+                        return {prepared: false, reason: '승인번호(APPR_NO) 열을 찾지 못함'};
+                    }
+                    const cellApi = GridObj.cells(target.rowId, approvalColumn);
+                    const cell = cellApi && cellApi.cell;
+                    if (!(cell instanceof HTMLElement)) {
+                        return {prepared: false, reason: '승인번호 셀을 찾지 못함'};
+                    }
+                    GridObj.selectRowById(target.rowId, true, true, true);
+                    cell.setAttribute('data-eacc-slip-save-target', target.token);
+                    cell.scrollIntoView({block: 'nearest', inline: 'nearest'});
+                    return {prepared: true};
+                }
+                """,
+                {"rowId": row_id, "token": target_token},
+            )
+            if not prepared_cell or not prepared_cell.get("prepared"):
+                reason = (prepared_cell or {}).get("reason", "알 수 없는 원인")
+                raise BrowserAutomationError(f"전표 상세를 열 승인번호 셀을 준비하지 못했습니다: {reason}")
+
+            data_cell = main_frame.locator(
+                f"td[data-eacc-slip-save-target='{target_token}']"
+            )
+            data_cell.wait_for(state="visible", timeout=15_000)
+            with page.expect_popup(timeout=15_000) as popup_info:
+                data_cell.dblclick(delay=180)
+            slip_popup = popup_info.value
+            slip_popup.wait_for_url("**/slip_mgt.jsp**", timeout=15_000)
+            if slip_popup.evaluate("() => window.name") != "slip_mgt":
+                raise BrowserAutomationError("전표 상세 창 이름이 slip_mgt가 아닙니다.")
+
+            def handle_dialog(dialog) -> None:
+                message = str(dialog.message or "").strip()
+                if "성공적으로 처리 하였습니다." in message:
+                    dialog.accept()
+                    return
+                unexpected_dialogs.append(message or "내용 없는 브라우저 알림")
+                dialog.dismiss()
+
+            slip_popup.on("dialog", handle_dialog)
+            save_button = slip_popup.locator(
+                "a.btn",
+                has=slip_popup.get_by_text("저장", exact=True),
+            )
+            if save_button.count() != 1:
+                raise BrowserAutomationError("전표 상세 창에서 텍스트가 정확히 '저장'인 버튼을 찾지 못했습니다.")
+            save_button.click(timeout=15_000)
+            if unexpected_dialogs:
+                raise BrowserAutomationError(
+                    "전표 상세 저장 중 예상하지 못한 알림이 발생했습니다: "
+                    + unexpected_dialogs[0]
+                )
+
+            close_button = slip_popup.locator(
+                "a",
+                has=slip_popup.locator("img[alt='닫기']"),
+            )
+            if close_button.count() != 1:
+                raise BrowserAutomationError("전표 상세 창에서 닫기 버튼을 찾지 못했습니다.")
+            close_button.click(timeout=15_000)
+        except BrowserAutomationError:
+            raise
+        except Exception as exc:
+            raise BrowserAutomationError(f"전표 상세 저장 단계를 완료하지 못했습니다: {exc}") from exc
+        finally:
+            try:
+                main_frame.evaluate(
+                    """
+                    token => document.querySelectorAll('[data-eacc-slip-save-target]')
+                        .forEach(cell => {
+                            if (cell.getAttribute('data-eacc-slip-save-target') === token) {
+                                cell.removeAttribute('data-eacc-slip-save-target');
+                            }
+                        })
+                    """,
+                    target_token,
+                )
+            except Exception:
+                pass
+            if slip_popup is not None and not slip_popup.is_closed():
+                slip_popup.close()
+
     def _prepare_actual_merchant_registration(
         self,
         context,
@@ -1341,11 +1468,6 @@ class EAccountingBrowserService:
             raise ActualMerchantRegistrationError("등록할 사업자번호는 하이픈 없는 10자리 숫자여야 합니다.")
         if not merchant_name.strip():
             raise ActualMerchantRegistrationError("등록할 사업자명이 비어 있습니다.")
-        if transaction.actual_merchant_name.strip():
-            raise ActualMerchantRegistrationError(
-                f"이 행에는 이미 실구매처명 '{transaction.actual_merchant_name}'이 등록되어 있어 덮어쓰지 않습니다."
-            )
-
         self._prepared_actual_merchant_transaction_id = None
         self._prepared_actual_merchant_popup_object = None
         page = self._ensure_eaccounting_page(context, credentials)
@@ -1506,6 +1628,10 @@ class EAccountingBrowserService:
                 row_number=row.row_number,
                 total_row_count=row.total_row_count,
                 grid_row_id=row.row_id,
+                overwriting_existing=bool(
+                    transaction.actual_merchant_name.strip()
+                    or transaction.actual_merchant_code.strip()
+                ),
             )
         finally:
             if not prepared:
@@ -1582,27 +1708,13 @@ class EAccountingBrowserService:
         transaction: UnsubmittedTransaction,
     ) -> str:
         popup = self._prepared_actual_merchant_popup(transaction)
-        dialog_messages: list[str] = []
-        self._attach_accept_all_dialogs(popup, dialog_messages)
         try:
-            reset_button = popup.get_by_text("초기화", exact=True)
-            if reset_button.count() != 1:
-                reset_button = popup.locator(
-                    "input[type='button'][value='초기화'], input[type='reset'][value='초기화'], button:has-text('초기화')"
-                )
-            if reset_button.count() != 1:
-                raise ActualMerchantRegistrationError("실구매처 등록 팝업의 '초기화' 버튼을 하나로 찾지 못했습니다.")
-            try:
-                reset_button.evaluate("element => element.click()")
-                # 초기화 후 e-Acc가 1~2개의 확인 alert를 순차 표시할 수 있다.
-                # dialog handler가 모두 수락할 시간을 짧게 제공한다.
-                popup.wait_for_timeout(1_000)
-            except Exception as exc:
-                if not popup.is_closed():
-                    raise ActualMerchantRegistrationError(
-                        f"실구매처 입력 초기화를 완료하지 못했습니다: {exc}"
-                    ) from exc
-            return "실구매처 입력을 초기화하고 e-Acc 확인 팝업을 모두 처리했습니다."
+            # '초기화'를 누르면 이미 등록된 실구매처까지 비울 수 있다. 사용자가
+            # 덮어쓰기를 거부한 경우에는 어떤 저장·초기화 요청도 보내지 않고
+            # 준비된 팝업만 닫아 기존 e-Acc 값을 보존한다.
+            if not popup.is_closed():
+                popup.close()
+            return "실구매처 입력값을 저장하지 않고 등록 창을 닫았습니다."
         finally:
             self._prepared_actual_merchant_transaction_id = None
             self._prepared_actual_merchant_popup_object = None
@@ -2078,7 +2190,9 @@ class EAccountingBrowserService:
 
     @staticmethod
     def _query_unsubmitted(main_frame) -> None:
-        main_frame.locator("select#CARD_NO").select_option(value="C")
+        card_select = main_frame.locator("select#CARD_NO")
+        card_select.wait_for(state="visible", timeout=15_000)
+        card_select.select_option(value="C")
         main_frame.evaluate(
             """
             () => {

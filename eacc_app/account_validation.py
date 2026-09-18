@@ -9,15 +9,28 @@ from .models import UnsubmittedTransaction
 
 
 SPECIAL_OVERTIME_MEAL_ACCOUNT = "특근자식비"
-FIELD_SUPPORT_MEAL_ACCOUNT = "일반복리비-현장지원 (현장대리인 활동지원 식음료대)"
+SPECIAL_OVERTIME_MEAL_MAX_AMOUNT = Decimal("90000")
+SPECIAL_OVERTIME_MEAL_EMPLOYEE_CHECK_AMOUNT = Decimal("15000")
+FIELD_SUPPORT_MEAL_ACCOUNT = "일반복리비-현장지원"
+FIELD_SUPPORT_MEAL_DESCRIPTION = "현장대리인 활동지원 식음료대"
+FIELD_SUPPORT_BEVERAGE_ONLY_DESCRIPTIONS = (
+    "현장업무 수행시 식음료",
+    "(전담)SIte기초설계 수행시 식음료",
+)
 
 # These are exact account-name matches.  In particular, "일반복리비" must
 # not accidentally exclude "일반복리비-현장지원".
 EXCLUDED_ACCOUNTS = {
     "회의비": "회의비로 예외처리",
     "부서회의비": "부서회의비로 예외처리",
+    "부서회의비(캔미팅)": "부서회의비(캔미팅)로 예외처리",
     "업무회의비": "업무회의비로 예외처리",
-    "일반복리비": "일반복리비로 예외처리",
+    "일반복리비-건강지원": "일반복리비-건강지원로 예외처리",
+    "일반복리비-경조/화환": "일반복리비-경조/화환로 예외처리",
+    "일반복리비-경조사지원비": "일반복리비-경조사지원비로 예외처리",
+    "일반복리비-동호회": "일반복리비-동호회로 예외처리",
+    "일반복리비-기타": "일반복리비-기타로 예외처리",
+    "일반복리비-급여성복리비": "일반복리비-급여성복리비로 예외처리",
 }
 
 VEHICLE_RECEIPT_CATEGORIES = {
@@ -91,13 +104,44 @@ ALCOHOL_KEYWORDS = (
     "샴페인",
 )
 
+# 음료 전용 적요에서는 품목명과 금액·수량이 함께 읽힌 줄만 비교한다.
+# 상호명에 '베이커리'가 포함되는 것만으로는 예외처리하지 않기 위함이다.
+BEVERAGE_KEYWORDS = (
+    "음료", "커피", "아메리카노", "에스프레소", "espresso", "라떼", "latte",
+    "카푸치노", "cappuccino", "모카", "mocha", "콜드브루", "coldbrew", "프라페",
+    "frappe", "티", "tea", "녹차", "홍차", "밀크티", "주스", "juice", "에이드",
+    "ade", "레모네이드", "lemonade", "스무디", "smoothie", "탄산", "콜라", "cola",
+    "소다", "soda", "생수", "광천수", "삼다수", "water", "요구르트", "요거트",
+)
+_BEVERAGE_FUZZY_PATTERNS = (
+    # Windows OCR may read "아메리카노" as "아대|리카노" on folded thermal
+    # receipts.  This is deliberately narrow and is only used in the
+    # product-name crop for the beverage-only descriptions.
+    ("아메리카노", re.compile(r"아.{0,2}리카노")),
+)
+FOOD_KEYWORDS = (
+    "빵", "케이크", "케익", "베이글", "쿠키", "마카롱", "머핀", "도넛", "크로플",
+    "샌드위치", "토스트", "pastry", "cake", "bread", "식사", "밥", "도시락", "김밥",
+    "라면", "국수", "햄버거", "치킨", "피자", "떡볶이", "샐러드", "과자",
+)
+_ITEM_VALUE_OR_QUANTITY_PATTERN = re.compile(
+    r"(?:\d{1,3}(?:[,.]\d{3})+|\d+)\s*(?:원|개|잔|병|캔|팩|ea)\b|"
+    r"(?:\d{1,3}(?:[,.]\d{3})+|\d+)\s*(?=$|\s)",
+    re.IGNORECASE,
+)
+_RECEIPT_SUMMARY_KEYWORDS = (
+    "합계", "총액", "결제", "승인", "부가세", "공급가", "과세", "면세", "할부",
+    "카드번호", "거래일시", "결제일시", "영수증번호", "번호", "금액", "사업자",
+    "주소", "전화", "대표", "가맹점", "매장", "상호",
+)
+
 
 @dataclass(frozen=True, slots=True)
 class AccountValidationResult:
     """The account-specific rule outcome kept separate from OCR validation."""
 
     transaction_id: str
-    status: str  # 정상 / 정상(i) / 예외 / 검증대기
+    status: str  # 정상 / 정상(i) / 정상(w) / 예외 / 검증대기
     reasons: tuple[str, ...] = ()
     required_employee_count: int = 0
     matched_employee_names: tuple[str, ...] = ()
@@ -131,9 +175,29 @@ def validate_account_rules(
     if excluded_reason:
         return _result(transaction, "예외", (excluded_reason,))
 
-    if account_name == SPECIAL_OVERTIME_MEAL_ACCOUNT and transaction.amount >= Decimal("15000"):
+    if (
+        account_name == SPECIAL_OVERTIME_MEAL_ACCOUNT
+        and transaction.amount > SPECIAL_OVERTIME_MEAL_MAX_AMOUNT
+    ):
+        return _result(
+            transaction,
+            "예외",
+            (
+                "특근자식비 사용금액 초과"
+                f" (사용금액 {transaction.amount:,.0f}원 / 한도 90,000원)",
+            ),
+        )
+
+    # 15,000원까지는 적요에 직원 이름을 적지 않아도 허용한다.  따라서
+    # 인원 검증은 15,000원을 *초과*한 경우부터 시작한다.
+    if (
+        account_name == SPECIAL_OVERTIME_MEAL_ACCOUNT
+        and transaction.amount > SPECIAL_OVERTIME_MEAL_EMPLOYEE_CHECK_AMOUNT
+    ):
         required = int(
-            (transaction.amount / Decimal("15000")).to_integral_value(rounding=ROUND_CEILING)
+            (transaction.amount / SPECIAL_OVERTIME_MEAL_EMPLOYEE_CHECK_AMOUNT).to_integral_value(
+                rounding=ROUND_CEILING
+            )
         )
         matched_names = _matched_employee_names(description, employee_names)
         if len(matched_names) < required:
@@ -163,30 +227,48 @@ def validate_account_rules(
         )
 
     if account_name == _normalize(FIELD_SUPPORT_MEAL_ACCOUNT):
-        if transaction.amount > Decimal("200000"):
-            reasons.append("현장대리인 사용금액 초과")
-        if description:
-            reasons.append("불필요한 적요 작성")
-        if receipt_text is None:
-            pending_reason = "영수증 OCR 검증 대기"
+        normalized_description = _normalize(description)
+        expected_description = _normalize(FIELD_SUPPORT_MEAL_DESCRIPTION)
+        beverage_only_descriptions = {
+            _normalize(value) for value in FIELD_SUPPORT_BEVERAGE_ONLY_DESCRIPTIONS
+        }
+        # 적요는 입력값의 완전 일치 여부를 검증하지 않는다. 정해진 문구가
+        # 포함되어 있으면 뒤에 "_음료구매" 등 보조 설명이 붙어도 해당 검증
+        # 유형으로 분류한다.
+        if expected_description in normalized_description:
+            if transaction.amount > Decimal("200000"):
+                reasons.append("현장대리인 사용금액 초과")
+            if receipt_text is None:
+                pending_reason = "영수증 OCR 검증 대기"
+                return _result(
+                    transaction,
+                    "예외" if reasons else "검증대기",
+                    tuple((*reasons, pending_reason)),
+                )
+            alcohol_matches = _matching_keywords(receipt_text, ALCOHOL_KEYWORDS)
+            if alcohol_matches:
+                reasons.append("영수증에 주류포함" + f" ({', '.join(alcohol_matches)})")
+            if reasons:
+                return _result(transaction, "예외", tuple(reasons))
             return _result(
                 transaction,
-                "예외" if reasons else "검증대기",
-                tuple((*reasons, pending_reason)),
+                "정상",
+                (
+                    "현장대리인 활동지원 식음료대 확인"
+                    f" (사용금액 {transaction.amount:,.0f}원 / 적요 일치 / 주류 키워드 없음)",
+                ),
             )
-        alcohol_matches = _matching_keywords(receipt_text, ALCOHOL_KEYWORDS)
-        if alcohol_matches:
-            reasons.append("영수증에 주류포함" + f" ({', '.join(alcohol_matches)})")
-        if reasons:
-            return _result(transaction, "예외", tuple(reasons))
-        return _result(
-            transaction,
-            "정상",
-            (
-                "현장대리인 활동지원 식음료대 확인"
-                f" (사용금액 {transaction.amount:,.0f}원 / 적요 없음 / 주류 키워드 없음)",
-            ),
-        )
+
+        if any(value in normalized_description for value in beverage_only_descriptions):
+            return _validate_beverage_only_field_support_receipt(
+                transaction,
+                description,
+                receipt_text,
+            )
+
+        # 세 가지 지정 문구에 해당하지 않는 적요 자체는 결재 제외 사유가 아니다.
+        # 적요가 검증 대상을 분류할 뿐, 적요의 정확한 일치를 요구하지 않는다.
+        return _result(transaction, "정상", ("현장지원 적요: 별도 세부 검증 대상 아님",))
 
     expected_category = next(
         (name for name in VEHICLE_RECEIPT_CATEGORIES if _normalize(name) == account_name),
@@ -238,6 +320,138 @@ def validate_account_rules(
         )
 
     return _result(transaction, "정상", ("별도 계정별 검증 규칙 대상 아님",))
+
+
+def _validate_beverage_only_field_support_receipt(
+    transaction: UnsubmittedTransaction,
+    description: str,
+    receipt_text: str | None,
+) -> AccountValidationResult:
+    """Accept only beverage item lines for the two beverage-only descriptions.
+
+    The user explicitly allows an unreadable or unclassified item section.
+    That permissive case is recorded as ``정상(w)`` so it remains distinguishable from a
+    receipt whose priced/quantified product lines were actually identified as
+    beverages.
+    """
+    reasons: list[str] = []
+    if transaction.amount > Decimal("200000"):
+        reasons.append("현장대리인 사용금액 초과")
+    if receipt_text is None:
+        return _result(
+            transaction,
+            "예외" if reasons else "검증대기",
+            tuple((*reasons, "영수증 OCR 검증 대기")),
+        )
+
+    # 날짜·승인번호·금액 검증에 이미 사용한 OCR 원문에서만 품목을 판정한다.
+    # 음료 품목 판정을 위해 OCR을 별도로 재실행하지 않는다.
+    item_lines = _receipt_item_lines(receipt_text)
+    if not item_lines:
+        if reasons:
+            return _result(transaction, "예외", tuple(reasons))
+        return _result(
+            transaction,
+            "정상(w)",
+            (
+                "음료전용 적요: 품목 OCR 미검출 → 정상(w)",
+            ),
+        )
+
+    alcohol_matches: list[str] = []
+    food_matches: list[str] = []
+    beverage_matches: list[str] = []
+    beverage_line_count = 0
+    has_unclassified_item = False
+    for line in item_lines:
+        alcohol = _matching_keywords(line, ALCOHOL_KEYWORDS)
+        food = _matching_keywords(line, FOOD_KEYWORDS)
+        beverage = _matching_beverage_keywords(line)
+        if alcohol:
+            alcohol_matches.extend(alcohol)
+        if food:
+            food_matches.extend(food)
+        if alcohol or food:
+            continue
+        if beverage:
+            beverage_line_count += 1
+            beverage_matches.extend(beverage)
+        else:
+            has_unclassified_item = True
+
+    if alcohol_matches:
+        reasons.append(
+            "음료전용 적요: 주류 품목 감지"
+            f"({', '.join(dict.fromkeys(alcohol_matches))}) → 예외"
+        )
+    if food_matches:
+        reasons.append(
+            "음료전용 적요: 음식 품목 감지"
+            f"({', '.join(dict.fromkeys(food_matches))}) → 예외"
+        )
+    if reasons:
+        return _result(transaction, "예외", tuple(reasons))
+    if has_unclassified_item:
+        return _result(
+            transaction,
+            "정상(w)",
+            (
+                "음료전용 적요: 품목 미분류 → 정상(w)",
+            ),
+        )
+    if beverage_line_count:
+        return _result(
+            transaction,
+            "정상",
+            (
+                "음료전용 적요: 음료 품목 확인"
+                f"({', '.join(dict.fromkeys(beverage_matches))}) → 정상",
+            ),
+        )
+
+    # Defensive fallback: item_lines currently always produce a beverage or
+    # unclassified result, but keep the approval-safe state explicit.
+    return _result(
+        transaction,
+        "정상(w)",
+        ("음료전용 적요: 품목 OCR 미검출 → 정상(w)",),
+    )
+
+
+def _receipt_item_lines(receipt_text: str) -> tuple[str, ...]:
+    """Return readable priced/quantified product lines, excluding receipt totals."""
+    lines: list[str] = []
+    for raw_line in receipt_text.splitlines():
+        line = " ".join(raw_line.split())
+        normalized_line = _normalize(line)
+        if not line or not _ITEM_VALUE_OR_QUANTITY_PATTERN.search(line):
+            continue
+        if _is_receipt_summary_line(normalized_line):
+            continue
+        # A product line must contain a readable label in addition to its
+        # number. Pure numeric OCR fragments are not treated as a food item.
+        label = re.sub(r"[\d\s,.:/()\-]+", "", line)
+        if len(label) < 2:
+            continue
+        lines.append(line)
+    return tuple(dict.fromkeys(lines))
+
+
+def _is_receipt_summary_line(normalized_line: str) -> bool:
+    """Exclude only a pure payment/header line, not a product plus total line."""
+    remainder = normalized_line
+    for keyword in _RECEIPT_SUMMARY_KEYWORDS:
+        remainder = remainder.replace(_normalize(keyword), "")
+    remainder = re.sub(r"[\d\s,.:/()\-원개잔병캔팩]+", "", remainder)
+    return len(remainder) < 2
+
+
+def _matching_beverage_keywords(text: str) -> tuple[str, ...]:
+    """Return exact and narrowly fuzzy beverage names from a product row."""
+    normalized_text = _normalize(text)
+    exact = [keyword for keyword in BEVERAGE_KEYWORDS if _normalize(keyword) in normalized_text]
+    fuzzy = [name for name, pattern in _BEVERAGE_FUZZY_PATTERNS if pattern.search(normalized_text)]
+    return tuple(dict.fromkeys((*exact, *fuzzy)))
 
 
 def _result(

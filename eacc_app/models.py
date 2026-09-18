@@ -154,6 +154,10 @@ class ReceiptValidationResult:
     status: str
     checks: tuple[ReceiptFieldCheck, ...]
     ocr_text: str
+    # 날짜·승인번호·금액 보강용 OCR에는 깨진 문자 영역도 병합될 수 있다.
+    # 계정별 품목 판정은 추가 OCR 없이, 원본 전체 영수증을 한 번 읽은 이
+    # 안전한 본문만 사용한다. None이면 ocr_text 자체가 안전한 본문이다.
+    account_validation_text: str | None = None
     # OCR 전 단계에서 영수증이 없다는 사실도 행 단위 결과로 남긴다.
     # (예: 증빙유무가 #인데 결재선 창에 실제 이미지가 없는 경우)
     reason: str = ""
@@ -202,6 +206,20 @@ class ProcessingEvent:
 
 
 @dataclass(frozen=True, slots=True)
+class ExceptionMailUse:
+    """오늘 처리된 영수증 등록 예외건의 팀 안내메일용 최소 정보."""
+
+    transaction_id: str
+    cost_center: str
+    card_holder: str
+    approval_number: str
+    evidence_date: str
+    merchant: str
+    amount: Decimal
+    reason: str
+
+
+@dataclass(frozen=True, slots=True)
 class MailLogItem:
     log_id: int
     sent_at: str
@@ -214,3 +232,4 @@ class MailLogItem:
     reason: str
     transaction_ids: tuple[str, ...]
     outlook_message_id: str = ""
+    mail_batch_id: str = ""

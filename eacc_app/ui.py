@@ -2,18 +2,24 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import threading
 import tkinter as tk
 from dataclasses import replace
-from datetime import datetime
+from datetime import datetime, timedelta
 from pathlib import Path
 from tkinter import filedialog, font as tkfont, messagebox, ttk
+from uuid import uuid4
 
 import ttkbootstrap as tb
 import webview
 from PIL import Image, ImageTk
 
-from .account_validation import AccountValidationResult, validate_account_rules
+from .account_validation import (
+    AccountValidationResult,
+    SPECIAL_OVERTIME_MEAL_EMPLOYEE_CHECK_AMOUNT,
+    validate_account_rules,
+)
 from .browser_automation import (
     ActualMerchantPreparation,
     ActualMerchantRegistrationError,
@@ -29,7 +35,7 @@ from .browser_automation import (
     ReceiptNotAvailable,
 )
 from .employee_directory import EmployeeDirectoryError, load_employee_names, load_mail_recipients
-from .mail_notifications import MAIL_SUBJECT, MailRecipient, UnprocessedCardUse, open_outlook_send_context, outlook_delivery_status, render_mail_html, send_via_outlook
+from .mail_notifications import MAIL_SUBJECT, MailRecipient, UnprocessedCardUse, open_outlook_send_context, outlook_delivery_statuses, render_exception_mail_html, render_mail_html, send_via_outlook
 from .merchant_lookup import (
     BizNoLookupClient,
     MerchantLookupError,
@@ -43,6 +49,7 @@ from .models import (
     ReceiptImageResult,
     ReceiptValidationResult,
     MerchantLookupResult,
+    ExceptionMailUse,
     ProcessingEvent,
     UnsubmittedTransaction,
 )
@@ -52,6 +59,28 @@ from .storage import ImportRepository
 
 
 APP_TITLE = "E-Acc 법인카드 자동처리"
+MAIL_DELIVERY_RECHECK_DAYS = 7
+# Back off instead of hitting Outlook every five seconds. The final check is
+# about nine minutes after the send request, which gives Exchange time for a
+# large batch without turning a slow synchronisation into a false failure.
+MAIL_DELIVERY_POLL_DELAYS_MS = (10_000, 20_000, 30_000, 60_000, 120_000, 300_000)
+# e-Acc는 결재요청 창을 닫은 뒤 미상신 목록을 비동기로 갱신할 수 있다. 첫
+# 재조회 한 번으로 실패를 확정하면 정상 결재를 예외처리로 잘못 기록하므로,
+# 결재요청을 보낸 그 한 건만 단계적으로 재확인한다.
+EACC_APPROVAL_CONFIRMATION_DELAYS_MS = (1_000, 2_000, 4_000, 8_000)
+# 미처리건수 안내메일에서만 제외할 카드소지자다. e-Acc 조회 결과·자동 전표
+# 처리에는 영향을 주지 않으며, 메일 수신자별 묶음에 넣기 직전에만 적용한다.
+UNPROCESSED_MAIL_EXCLUDED_EMPLOYEE_NAMES = frozenset({"성태현"})
+
+
+def _normalized_merchant_name(value: str) -> str:
+    """Normalize only display-name differences, never business numbers."""
+    without_corporate_markers = re.sub(
+        r"\(?주식회사\)?|\(?㈜\)?|\(주\)",
+        "",
+        value or "",
+    )
+    return re.sub(r"[\s()\[\]{}.,·_-]+", "", without_corporate_markers).lower()
 
 # 화면 전체에서 재사용하는 색상 팔레트. 예전에는 같은 의미의 색(예: 파란색 강조,
 # 빨간색 경고)이 여러 곳에 조금씩 다른 헥스코드로 흩어져 있었는데, 여기 한 곳에
@@ -86,6 +115,36 @@ APPROVAL_RESULT_STATUSES = frozenset(
         "예외처리",
     }
 )
+
+# 예외처리 안내는 코스트센터의 담당자에게만 보내며, 실제 이메일 주소는
+# 암호화된 직원 수신자 명부에서 실행 시점에만 해제한다. 화면·DB에는 주소를
+# 표시하거나 원문 그대로 저장하지 않는다.
+TEAM_EXCEPTION_MAIL_RECIPIENTS = {
+    "강북치국설계팀": "이한샘",
+    "강남치국설계팀": "정지윤",
+    "경남치국설계팀": "홍수진",
+    "서부치국설계팀": "정호윤",
+    "중부치국설계팀": "박영은",
+    "경북치국설계팀": "이영미",
+    "치국설계o/i팀": "장영희",
+}
+TEAM_EXCEPTION_DISPLAY_NAMES = {
+    "강북": "강북치국설계팀",
+    "강북치국설계팀": "강북치국설계팀",
+    "강남": "강남치국설계팀",
+    "강남치국설계팀": "강남치국설계팀",
+    "경남": "경남치국설계팀",
+    "경남치국설계팀": "경남치국설계팀",
+    "서부": "서부치국설계팀",
+    "서부치국설계팀": "서부치국설계팀",
+    "중부": "중부치국설계팀",
+    "중부치국설계팀": "중부치국설계팀",
+    "경북": "경북치국설계팀",
+    "경북치국설계팀": "경북치국설계팀",
+    "o/i팀": "치국설계O/I 팀",
+    "oi팀": "치국설계O/I 팀",
+    "치국설계o/i팀": "치국설계O/I 팀",
+}
 
 # 새 UI는 Windows에 설치된 Edge/WebView2 버전에 의존하지 않는다. 이 고정
 # 런타임 폴더 전체를 배포물에 포함하고, 개발 PC도 정확히 같은 파일을 사용한다.
@@ -194,6 +253,7 @@ class EAccApplication(tb.Window):
         self._current_eacc_total_rows = 0
         self._current_eacc_grid_row_id = ""
         self._pending_approval_transactions: dict[str, UnsubmittedTransaction] = {}
+        self._pending_approval_confirmation_attempts: dict[str, int] = {}
         self._processing_result_filter: str | None = None
         self._processing_filter_navigation = False
         self._resume_after_approval_refresh = False
@@ -201,12 +261,19 @@ class EAccApplication(tb.Window):
         self._session_completed_ids: set[str] = set()
         self._session_exception_ids: set[str] = set()
         self._session_pg_waiting_ids: set[str] = set()
+        self._session_pg_review_ids: set[str] = set()
         self._session_target_ids: set[str] = set()
         self._excluded_transaction_ids: set[str] = set()
         self._bizno_client = BizNoLookupClient()
         self._pending_receipt_transaction: UnsubmittedTransaction | None = None
         self._pending_merchant_transaction: UnsubmittedTransaction | None = None
         self._automatic_target_validation = False
+        # 자동 처리 중에는 사용자가 즉시 중단하지 않고, 현재 행을 모두
+        # 마친 다음 다음 e-Acc 행을 읽기 직전에 멈춘다.
+        self._automation_active = False
+        self._pause_requested = False
+        self._automation_paused = False
+        self._busy = False
         self._batch_queue: list[UnsubmittedTransaction] = []
         self._batch_current: UnsubmittedTransaction | None = None
         self._batch_total = 0
@@ -215,6 +282,13 @@ class EAccApplication(tb.Window):
         self._employee_names: tuple[str, ...] = ()
         self._mail_recipients: tuple[dict[str, str], ...] = ()
         self._unprocessed_card_uses: tuple[UnprocessedCardUse, ...] = ()
+        self._exception_team_mail_sending = False
+        # Outlook is a single-user desktop application.  Never make delivery
+        # checks compete with a bulk send through separate COM calls.
+        self._mail_outlook_lock = threading.Lock()
+        self._mail_delivery_check_running = False
+        self._delivery_poll_attempts_left = 0
+        self._active_mail_delivery_batch_id = ""
         self._employee_directory_error = ""
         try:
             self._employee_names = load_employee_names()
@@ -234,6 +308,10 @@ class EAccApplication(tb.Window):
         self._refresh_processing_history()
         self._refresh_processing_results()
         self._refresh_mail_log()
+        # A previous run may have closed before Outlook moved a queued message
+        # into Sent Items. Recheck only recent unresolved records in the
+        # background; startup must not freeze either UI or Outlook.
+        self.after(2_000, self._request_recent_mail_delivery_check)
         self.protocol("WM_DELETE_WINDOW", self._on_close)
 
     def _configure_styles(self) -> None:
@@ -386,7 +464,7 @@ class EAccApplication(tb.Window):
             button_box,
             text="자동 처리 시작",
             style="Accent.TButton",
-            command=self._read_current_first_target,
+            command=self._toggle_automatic_processing,
         )
         self.current_target_button.pack(side="top", fill="x")
 
@@ -401,7 +479,7 @@ class EAccApplication(tb.Window):
             "처리대상": tk.StringVar(value="0"),
             "처리 완료": tk.StringVar(value="0"),
             "예외처리": tk.StringVar(value="0"),
-            "PG 등록": tk.StringVar(value="0"),
+            "PG 검증": tk.StringVar(value="0"),
         }
         # 카드마다 상태에 맞는 색을 입혀서(초록=완료, 빨강=예외처리, 주황=PG 대기)
         # 숫자만 나열되어 있던 예전보다 한눈에 어디를 봐야 하는지 알 수 있게 한다.
@@ -409,7 +487,7 @@ class EAccApplication(tb.Window):
             "처리대상": "Neutral",
             "처리 완료": "Success",
             "예외처리": "Danger",
-            "PG 등록": "Warning",
+            "PG 검증": "Warning",
         }
         for index, (caption, variable) in enumerate(self.session_vars.items()):
             tone = card_tones[caption]
@@ -419,7 +497,7 @@ class EAccApplication(tb.Window):
             result_filter = {
                 "처리 완료": "completed",
                 "예외처리": "exception",
-                "PG 등록": "pg_pending",
+                "PG 검증": "pg_review",
             }.get(caption)
             caption_label = ttk.Label(
                 card,
@@ -583,7 +661,7 @@ class EAccApplication(tb.Window):
             self.history_tree.column(column, width=widths[column], anchor="center" if column != "파일명" else "w")
 
     def _build_processing_table(self, parent: ttk.Frame) -> None:
-        columns = ("시각", "상태", "승인번호", "증빙일자", "금액", "거래처", "사유", "내부거래ID")
+        columns = ("시각", "상태", "승인번호", "증빙일자", "금액", "계정명", "거래처", "사유", "내부거래ID")
         self.processing_tree = ttk.Treeview(parent, columns=columns, show="headings")
         vertical = ttk.Scrollbar(parent, orient="vertical", command=self.processing_tree.yview)
         horizontal = ttk.Scrollbar(parent, orient="horizontal", command=self.processing_tree.xview)
@@ -599,16 +677,17 @@ class EAccApplication(tb.Window):
             "승인번호": 100,
             "증빙일자": 105,
             "금액": 100,
+            "계정명": 170,
             "거래처": 180,
             "사유": 440,
             "내부거래ID": 180,
         }
         for column in columns:
             self.processing_tree.heading(column, text=column)
-            self.processing_tree.column(column, width=widths[column], anchor="center" if column not in {"거래처", "사유", "내부거래ID"} else "w")
+            self.processing_tree.column(column, width=widths[column], anchor="center" if column not in {"계정명", "거래처", "사유", "내부거래ID"} else "w")
 
     def _build_mail_log_table(self, parent: ttk.Frame) -> None:
-        columns = ("처리시간", "성명", "이메일", "대상 건수", "메일 제목", "상태", "상세 사유")
+        columns = ("처리시간", "성명", "이메일", "대상 건수", "메일 제목", "상태", "상세 사유", "팀 명")
         self.mail_log_tree = ttk.Treeview(parent, columns=columns, show="headings")
         vertical = ttk.Scrollbar(parent, orient="vertical", command=self.mail_log_tree.yview)
         horizontal = ttk.Scrollbar(parent, orient="horizontal", command=self.mail_log_tree.xview)
@@ -618,7 +697,7 @@ class EAccApplication(tb.Window):
         horizontal.grid(row=1, column=0, sticky="ew")
         parent.rowconfigure(0, weight=1)
         parent.columnconfigure(0, weight=1)
-        widths = {"처리시간": 170, "성명": 95, "이메일": 235, "대상 건수": 85, "메일 제목": 260, "상태": 130, "상세 사유": 380}
+        widths = {"처리시간": 170, "성명": 95, "이메일": 235, "대상 건수": 85, "메일 제목": 260, "상태": 130, "상세 사유": 380, "팀 명": 165}
         for column in columns:
             self.mail_log_tree.heading(column, text=column)
             self.mail_log_tree.column(column, width=widths[column], anchor="center" if column in {"처리시간", "성명", "대상 건수", "상태"} else "w")
@@ -644,6 +723,7 @@ class EAccApplication(tb.Window):
             "최종 결과",
             "핵심 사유",
             "내부거래ID",
+            "팀 명",
         )
         self.processing_results_tree = ttk.Treeview(parent, columns=columns, show="headings")
         vertical = ttk.Scrollbar(parent, orient="vertical", command=self.processing_results_tree.yview)
@@ -668,6 +748,7 @@ class EAccApplication(tb.Window):
             "최종 결과": 125,
             "핵심 사유": 330,
             "내부거래ID": 205,
+            "팀 명": 165,
         }
         for column in columns:
             self.processing_results_tree.heading(column, text=column)
@@ -680,6 +761,9 @@ class EAccApplication(tb.Window):
         # 결과만 행 전체의 옅은 배경과 진한 글자색으로 눈에 띄게 한다.
         self.processing_results_tree.tag_configure(
             "결과-예외처리", foreground=PALETTE["danger_fg"], background=PALETTE["danger_bg"]
+        )
+        self.processing_results_tree.tag_configure(
+            "결과-증빙예외", foreground=PALETTE["warning_fg"], background=PALETTE["warning_bg"]
         )
         self.processing_results_tree.tag_configure(
             "결과-PG등록대기", foreground=PALETTE["warning_fg"], background=PALETTE["warning_bg"]
@@ -706,6 +790,106 @@ class EAccApplication(tb.Window):
             on_error=lambda exc: self.after(0, self._on_browser_error, exc),
         )
 
+    def _toggle_automatic_processing(self) -> None:
+        """Start, request a safe pause, or resume the one-row automation."""
+        if self._automation_active:
+            if self._pause_requested:
+                return
+            self._pause_requested = True
+            self._refresh_automation_button()
+            self.status_message.set(
+                "일시 정지 요청됨: 현재 처리 중인 한 건을 완료한 뒤 다음 e-Acc 행을 읽기 전에 멈춥니다."
+            )
+            return
+
+        if self._automation_paused:
+            self._automation_paused = False
+            self._automation_active = True
+            self._pause_requested = False
+            self._refresh_automation_button()
+            self.status_message.set("자동 처리를 재개합니다. e-Acc의 다음 처리대상을 읽는 중입니다...")
+            self._read_current_first_target(new_run=False)
+            return
+
+        if self._busy:
+            return
+        # 새 자동 실행은 이전 실행의 "이번 실행에서는 재시도하지 않을 예외 행"
+        # 을 이어받으면 안 된다. 화면 집계만 새로 시작하고 제외 목록을 남겨두면
+        # 실제 e-Acc 행이 남아 있어도 처리 가능 대상 없음으로 끝날 수 있다.
+        # 일시정지 후 재개 경로는 위에서 이미 반환하므로 제외 목록을 유지한다.
+        self._excluded_transaction_ids.clear()
+        self._automation_active = True
+        self._pause_requested = False
+        self._refresh_automation_button()
+        self._read_current_first_target(new_run=True)
+
+    def _automation_button_control(self) -> tuple[str, str, bool]:
+        """Return button mode, label and enabled state for native/web UI."""
+        if self._pause_requested:
+            return "pause-requested", "일시 정지 요청됨", False
+        if self._automation_active:
+            return "pause", "일시 정지", True
+        if self._automation_paused:
+            return "resume", "자동 처리 재개", True
+        return "start", "자동 처리 시작", not self._busy
+
+    def _refresh_automation_button(self) -> None:
+        if not hasattr(self, "current_target_button"):
+            return
+        _mode, label, enabled = self._automation_button_control()
+        self.current_target_button.configure(
+            text=label,
+            state="normal" if enabled else "disabled",
+        )
+
+    def _pause_after_current_target(self, transaction: UnsubmittedTransaction | None) -> bool:
+        """Stop only at the boundary after the current row has fully finished."""
+        if not self._pause_requested:
+            return False
+        self._pause_requested = False
+        self._automation_active = False
+        self._automation_paused = True
+        self._resume_after_approval_refresh = False
+        self._set_busy(False)
+        target = transaction or self._current_target
+        target_text = (
+            f"승인번호 {target.approval_number} 건의 처리를 완료했습니다. "
+            if target is not None
+            else "현재 건의 처리를 완료했습니다. "
+        )
+        self.status_message.set(
+            f"일시 정지됨: {target_text}▶ 자동 처리 재개를 누르면 다음 e-Acc 행부터 계속합니다."
+        )
+        return True
+
+    def _pause_before_new_target(self) -> bool:
+        """Honor a pause that arrived while the next e-Acc row was being read.
+
+        Reading a grid row is asynchronous.  If the pause button is pressed in
+        that short interval, the newly read row has not started OCR/PG/approval
+        work yet, so leave it untouched and re-read it on resume.
+        """
+        if not self._pause_requested:
+            return False
+        self._pause_requested = False
+        self._automation_active = False
+        self._automation_paused = True
+        self._set_busy(False)
+        self.status_message.set(
+            "일시 정지됨: 방금 읽은 e-Acc 행은 아직 처리하지 않았습니다. "
+            "▶ 자동 처리 재개를 누르면 해당 행부터 다시 읽어 계속합니다."
+        )
+        return True
+
+    def _finish_automation(self) -> None:
+        """Return the processing control to its normal start state."""
+        if not (self._automation_active or self._pause_requested or self._automation_paused):
+            return
+        self._automation_active = False
+        self._pause_requested = False
+        self._automation_paused = False
+        self._refresh_automation_button()
+
     def _read_current_first_target(self, *, new_run: bool = True) -> None:
         # A user may have closed Electron/Edge after a failed attempt. That
         # leaves a dead CDP endpoint behind, so every fresh user-started run
@@ -726,6 +910,11 @@ class EAccApplication(tb.Window):
 
     def _on_current_first_target(self, current: CurrentEAccTarget) -> None:
         self._set_busy(False)
+        if self._pause_before_new_target():
+            return
+        # e-Acc가 이미 내려준 현재 목록의 코스트센터를 결과 이력용으로
+        # 저장한다. 별도 e-Acc 조회나 OCR은 전혀 수행하지 않는다.
+        self.repository.store_transaction_snapshots(current.visible_transactions)
         transaction = current.transaction
         self._current_target = transaction
         self._current_eacc_row_number = current.row_number
@@ -791,12 +980,14 @@ class EAccApplication(tb.Window):
     def _on_current_target_error(self, error: Exception) -> None:
         self._set_busy(False)
         if isinstance(error, NoEligibleTransactions):
+            self._finish_automation()
             self._current_target = None
             self._current_target_row = None
             self.current_target_message.set("현재 처리대상: 없음 (이번 실행의 예외처리 행만 남음)")
             self.status_message.set("처리 가능 대상 없음: 예외처리한 행 외에는 남아 있지 않습니다.")
             return
         if isinstance(error, NoUnsubmittedTransactions):
+            self._finish_automation()
             self._current_target = None
             self._current_target_row = None
             self.current_target_message.set("현재 처리대상: 없음 (미상신내역 검색 결과 0건)")
@@ -807,6 +998,8 @@ class EAccApplication(tb.Window):
     def _continue_after_exception(self, transaction: UnsubmittedTransaction) -> None:
         """Do not retry an exception row; re-read e-Acc for the next eligible row."""
         self._excluded_transaction_ids.add(transaction.transaction_id)
+        if self._pause_after_current_target(transaction):
+            return
         self._set_busy(True, "예외 행을 제외하고 e-Acc의 다음 처리대상을 읽는 중입니다...")
         self.browser_service.read_current_first_target(
             None,
@@ -867,11 +1060,22 @@ class EAccApplication(tb.Window):
         self._import_file(str(path))
         if not self._resume_after_approval_refresh:
             return
+        # e-Acc 반영이 아직 끝나지 않아 재확인이 예약된 상태다. 이때 자동
+        # 처리를 재개하면 같은 행을 다시 처리하거나 결재 상태를 오판할 수 있다.
+        if self._pending_approval_transactions:
+            self._set_busy(
+                True,
+                "결재요청 반영을 확인하는 중입니다. 다음 재조회까지 잠시 기다려 주세요...",
+            )
+            return
         self._resume_after_approval_refresh = False
         if not self._last_approval_removed_from_list:
+            self._finish_automation()
             self.status_message.set(
-                "결재요청 행이 최신 목록에 남아 있어 자동 처리를 중지했습니다. e-Acc 상태를 확인해 주세요."
+                "결재요청 행이 재확인 시간 동안 최신 목록에 남아 있어 자동 처리를 중지했습니다. e-Acc 상태를 확인해 주세요."
             )
+            return
+        if self._pause_after_current_target(self._current_target):
             return
         self.status_message.set("결재 처리 완료를 확인했습니다. 다음 첫 행을 자동 처리합니다...")
         self.after(300, lambda: self._read_current_first_target(new_run=False))
@@ -880,6 +1084,7 @@ class EAccApplication(tb.Window):
         self._set_busy(False)
         if isinstance(error, NoUnsubmittedTransactions):
             self._show_empty_search_result()
+            self._finish_automation()
             if self._resume_after_approval_refresh:
                 self._resume_after_approval_refresh = False
                 self.status_message.set("결재 처리 완료를 확인했습니다. 추가 처리 대상이 없습니다.")
@@ -887,6 +1092,7 @@ class EAccApplication(tb.Window):
         if isinstance(error, BrowserLoginRequired):
             messagebox.showinfo("i-NET 로그인 필요", str(error), parent=self)
             self.status_message.set("i-NET 아이디와 비밀번호를 입력한 뒤 작업 버튼을 다시 눌러 주세요.")
+            self._finish_automation()
             return
         if isinstance(error, BrowserAutomationError):
             messagebox.showerror("자동 불러오기 실패", str(error), parent=self)
@@ -897,6 +1103,7 @@ class EAccApplication(tb.Window):
                 parent=self,
             )
         self.status_message.set(f"자동 불러오기 실패: {error}")
+        self._finish_automation()
 
     def _show_empty_search_result(self) -> None:
         """Show a normal zero-row search result without treating it as an error."""
@@ -976,6 +1183,8 @@ class EAccApplication(tb.Window):
             self._session_pg_waiting_ids.add(transaction.transaction_id)
         elif status == "실구매처 등록 완료":
             self._session_pg_waiting_ids.discard(transaction.transaction_id)
+        if status.startswith("PG ") or status.startswith("실구매처 등록"):
+            self._session_pg_review_ids.add(transaction.transaction_id)
         self._refresh_session_dashboard()
         if status in APPROVAL_RESULT_STATUSES:
             self._processing_statuses[transaction.transaction_id] = status
@@ -989,7 +1198,11 @@ class EAccApplication(tb.Window):
         self._session_completed_ids.clear()
         self._session_exception_ids.clear()
         self._session_pg_waiting_ids.clear()
+        self._session_pg_review_ids.clear()
         self._session_target_ids.clear()
+        # 결재요청 결과가 목록에 남은 건은 한 번만 재처리한다. 새 자동 처리
+        # 실행에서는 다시 독립적으로 판단해야 하므로 세션 이력도 초기화한다.
+        getattr(self, "_approval_reprocess_once_ids", set()).clear()
         self._refresh_session_dashboard()
 
     def _refresh_session_dashboard(self) -> None:
@@ -998,7 +1211,7 @@ class EAccApplication(tb.Window):
         self.session_vars["처리대상"].set(f"{len(self._session_target_ids):,}")
         self.session_vars["처리 완료"].set(f"{len(self._session_completed_ids):,}")
         self.session_vars["예외처리"].set(f"{len(self._session_exception_ids):,}")
-        self.session_vars["PG 등록"].set(f"{len(self._session_pg_waiting_ids):,}")
+        self.session_vars["PG 검증"].set(f"{len(self._session_pg_review_ids):,}")
 
     def _refresh_after_eacc_approval(
         self,
@@ -1008,11 +1221,20 @@ class EAccApplication(tb.Window):
         transaction = transaction or self._selected_transaction("처리 결과 재조회")
         if transaction is None:
             return
+        # 이전 확인에서 이미 행이 사라져 처리 완료가 된 경우, 예약된 콜백이
+        # 뒤늦게 실행되어 불필요한 e-Acc 조회를 하지 않도록 막는다.
+        if (
+            self._resume_after_approval_refresh
+            and transaction.transaction_id not in self._pending_approval_transactions
+        ):
+            return
         self._pending_approval_transactions[transaction.transaction_id] = transaction
+        attempt = self._pending_approval_confirmation_attempts.get(transaction.transaction_id, 0)
         self._record_processing_event(
             transaction,
             "결재요청 확인대기",
-            "e-Acc에서 이 행의 결재 요청을 실행한 뒤 최신 목록으로 확인을 시작했습니다.",
+            "e-Acc 결재요청 반영 여부를 최신 목록에서 확인하는 중입니다. "
+            f"({attempt + 1}/{len(EACC_APPROVAL_CONFIRMATION_DELAYS_MS)}차)",
         )
         self._set_busy(True, "e-Acc의 최신 목록을 다시 조회하여 결재 요청 결과를 확인하는 중입니다...")
         self.browser_service.collect_unsubmitted(
@@ -1031,7 +1253,7 @@ class EAccApplication(tb.Window):
             receipt = self._receipt_results.get(transaction.transaction_id)
             account_result = self._evaluate_account_rules(
                 transaction,
-                receipt.ocr_text if receipt is not None else None,
+                self._account_validation_text(receipt) if receipt is not None else None,
             )
         if account_result.status == "예외":
             return account_result.reason_text
@@ -1051,10 +1273,15 @@ class EAccApplication(tb.Window):
             merchant = self._merchant_results.get(transaction.transaction_id)
             if merchant is None or merchant.registration_status != "등록 완료":
                 return (
-                    "PG일반 행의 실구매처 등록이 완료되지 않았습니다. "
+                    "PG일반·기타4 행의 실구매처 등록이 완료되지 않았습니다. "
                     "사업자번호·비즈노 상호조회와 실구매처 등록을 먼저 완료해 주세요."
                 )
         return None
+
+    @staticmethod
+    def _account_validation_text(receipt: ReceiptValidationResult) -> str:
+        """Use baseline OCR for account rules, not noisy field-repair OCR."""
+        return receipt.account_validation_text or receipt.ocr_text
 
     def _evaluate_account_rules(
         self,
@@ -1063,10 +1290,19 @@ class EAccApplication(tb.Window):
     ) -> AccountValidationResult:
         """Apply account rules and persist a blocking outcome exactly once."""
         employee_names = self._employee_names
-        result = validate_account_rules(transaction, employee_names, receipt_text)
+        result = validate_account_rules(
+            transaction,
+            employee_names,
+            receipt_text,
+        )
         # No usable employee master must never make an overtime meal pass by
         # accident.  The standard insufficient-headcount reason is retained.
-        if not employee_names and transaction.account_name.strip() == "특근자식비":
+        if (
+            not employee_names
+            and transaction.account_name.strip() == "특근자식비"
+            and transaction.amount > SPECIAL_OVERTIME_MEAL_EMPLOYEE_CHECK_AMOUNT
+            and not any("사용금액 초과" in reason for reason in result.reasons)
+        ):
             result = AccountValidationResult(
                 transaction_id=transaction.transaction_id,
                 status="예외",
@@ -1158,6 +1394,7 @@ class EAccApplication(tb.Window):
         self._set_busy(False)
         self._record_processing_event(transaction, "결재요청 중지", result)
         self.status_message.set(result)
+        self._finish_automation()
 
     def _on_approval_request_submitted(
         self,
@@ -1166,11 +1403,15 @@ class EAccApplication(tb.Window):
     ) -> None:
         self._set_busy(False)
         self._pending_approval_transactions[transaction.transaction_id] = transaction
+        self._pending_approval_confirmation_attempts[transaction.transaction_id] = 0
         self._resume_after_approval_refresh = True
         self._last_approval_removed_from_list = False
         self._record_processing_event(transaction, "결재요청 전송", result)
-        self.status_message.set("결재요청을 전송했습니다. e-Acc 최신 목록으로 처리 결과를 자동 확인합니다...")
-        self.after(700, lambda: self._refresh_after_eacc_approval(transaction))
+        first_delay = EACC_APPROVAL_CONFIRMATION_DELAYS_MS[0]
+        self.status_message.set(
+            f"결재요청을 전송했습니다. {first_delay // 1000}초 뒤 e-Acc 최신 목록으로 처리 결과를 자동 확인합니다..."
+        )
+        self.after(first_delay, lambda: self._refresh_after_eacc_approval(transaction))
 
     def _on_approval_request_error(
         self,
@@ -1196,7 +1437,7 @@ class EAccApplication(tb.Window):
         if not is_pg_business_type(transaction.business_type):
             messagebox.showinfo(
                 "PG 조회 대상 아님",
-                f"업종 '{transaction.business_type}'은(는) PG일반 조회 대상이 아닙니다.",
+                f"업종 '{transaction.business_type}'은(는) PG일반·기타4 조회 대상이 아닙니다.",
                 parent=self,
             )
             return
@@ -1246,7 +1487,7 @@ class EAccApplication(tb.Window):
         business_number: str,
     ) -> None:
         self._receipt_results[transaction.transaction_id] = validation
-        self._evaluate_account_rules(transaction, validation.ocr_text)
+        self._evaluate_account_rules(transaction, self._account_validation_text(validation))
         self._apply_filter()
         self.status_message.set("비즈노에서 사업자번호로 상호를 조회하는 중입니다...")
 
@@ -1274,16 +1515,34 @@ class EAccApplication(tb.Window):
     ) -> None:
         self._set_busy(False)
         self._pending_merchant_transaction = None
+        existing_match, comparison_reason = self._existing_actual_merchant_matches(
+            transaction,
+            business_number,
+            merchant_name,
+        )
         self._merchant_results[transaction.transaction_id] = MerchantLookupResult(
             transaction_id=transaction.transaction_id,
-            status="조회완료",
+            status="기존 실구매처 일치" if existing_match else "기존값 불일치"
+            if transaction.actual_merchant_name.strip() or transaction.actual_merchant_code.strip()
+            else "조회완료",
             business_number=business_number,
             merchant_name=merchant_name,
+            registration_status="검증 완료" if existing_match else "미등록",
+            registration_reason=comparison_reason,
+        )
+        if existing_match:
+            self._continue_with_existing_actual_merchant(transaction)
+            return
+
+        event_status = (
+            "PG 기존 실구매처 불일치"
+            if transaction.actual_merchant_name.strip() or transaction.actual_merchant_code.strip()
+            else "PG 상호조회 완료"
         )
         self._record_processing_event(
             transaction,
-            "PG 상호조회 완료",
-            f"사업자번호 {business_number} / 비즈노 상호 {merchant_name}",
+            event_status,
+            comparison_reason,
         )
         self._pending_merchant_transaction = transaction
         self._set_busy(True, "PG 실구매처 등록 창을 열고 조회 결과를 자동 입력하는 중입니다...")
@@ -1300,6 +1559,36 @@ class EAccApplication(tb.Window):
             ),
         )
 
+    @staticmethod
+    def _existing_actual_merchant_matches(
+        transaction: UnsubmittedTransaction,
+        business_number: str,
+        merchant_name: str,
+    ) -> tuple[bool, str]:
+        """Compare a saved real merchant to the receipt/BizNo result safely."""
+        saved_name = transaction.actual_merchant_name.strip()
+        saved_code = re.sub(r"\D", "", transaction.actual_merchant_code)
+        if saved_code:
+            matches = saved_code == business_number
+            return (
+                matches,
+                "기존 실구매처코드 "
+                f"{saved_code} / 영수증·비즈노 사업자번호 {business_number} "
+                + ("일치" if matches else "불일치")
+                + f" / 기존 상호 {saved_name or '-'} / 비즈노 상호 {merchant_name}",
+            )
+        if saved_name:
+            matches = _normalized_merchant_name(saved_name) == _normalized_merchant_name(
+                merchant_name
+            )
+            return (
+                matches,
+                "기존 실구매처코드 미등록 / 기존 상호 "
+                f"{saved_name} / 비즈노 상호 {merchant_name} "
+                + ("정규화 일치" if matches else "불일치"),
+            )
+        return False, f"사업자번호 {business_number} / 비즈노 상호 {merchant_name}"
+
     def _on_pg_merchant_error(self, error: Exception) -> None:
         self._set_busy(False)
         transaction = self._pending_merchant_transaction
@@ -1314,6 +1603,7 @@ class EAccApplication(tb.Window):
             self._record_processing_event(transaction, "PG 상호조회 확인 필요", reason)
             self._apply_filter()
         self.status_message.set(f"PG 상호 조회 확인 필요: {error}")
+        self._finish_automation()
 
     def _on_actual_merchant_prepared(
         self,
@@ -1340,12 +1630,25 @@ class EAccApplication(tb.Window):
         )
         self._apply_filter()
         self.status_message.set("PG 입력값 확인을 기다리는 중입니다.")
+        if preparation.overwriting_existing:
+            prompt = (
+                "현재 등록된 실구매처가 영수증·비즈노 조회값과 일치하지 않습니다.\n\n"
+                f"기존 사업자번호: {transaction.actual_merchant_code or '-'}\n"
+                f"기존 사업자명: {transaction.actual_merchant_name or '-'}\n\n"
+                f"조회 사업자번호: {result.business_number}\n"
+                f"조회 사업자명: {result.merchant_name}\n\n"
+                "조회값으로 덮어쓰시겠습니까?"
+            )
+        else:
+            prompt = (
+                "e-Acc 실구매처 등록 창에 아래 값을 자동 입력했습니다.\n\n"
+                f"사업자번호: {result.business_number}\n"
+                f"사업자명: {result.merchant_name}\n\n"
+                "입력 내용이 맞습니까?"
+            )
         confirm = messagebox.askyesno(
-            "PG 입력 확인",
-            "e-Acc 실구매처 등록 창에 아래 값을 자동 입력했습니다.\n\n"
-            f"사업자번호: {result.business_number}\n"
-            f"사업자명: {result.merchant_name}\n\n"
-            "입력 내용이 맞습니까?",
+            "PG 실구매처 덮어쓰기 확인" if preparation.overwriting_existing else "PG 입력 확인",
+            prompt,
             parent=self,
         )
         if confirm:
@@ -1360,7 +1663,7 @@ class EAccApplication(tb.Window):
                 ),
             )
             return
-        self._set_busy(True, "PG 입력을 초기화하고 e-Acc 확인 팝업을 정리하는 중입니다...")
+        self._set_busy(True, "PG 입력을 저장하지 않고 e-Acc 등록 창을 닫는 중입니다...")
         self.browser_service.reset_prepared_actual_merchant_registration(
             transaction,
             on_success=lambda reset: self.after(
@@ -1428,6 +1731,7 @@ class EAccApplication(tb.Window):
         title = "실구매처 등록 실패" if isinstance(error, ActualMerchantRegistrationError) else "실구매처 등록 오류"
         messagebox.showerror(title, str(error), parent=self)
         self.status_message.set(f"실구매처 등록 확인 필요: {error}")
+        self._finish_automation()
 
     def _on_receipt_download(self, result: ReceiptImageResult) -> None:
         transaction = next(
@@ -1472,7 +1776,7 @@ class EAccApplication(tb.Window):
             None,
         )
         if transaction is not None:
-            self._evaluate_account_rules(transaction, validation.ocr_text)
+            self._evaluate_account_rules(transaction, self._account_validation_text(validation))
             details = " / ".join(
                 f"{check.field_name} {'일치' if check.is_match else '불일치'}"
                 for check in validation.checks
@@ -1498,6 +1802,9 @@ class EAccApplication(tb.Window):
                 self.status_message.set(f"계정별 예외처리: {account_result.reason_text}")
                 self._continue_after_exception(transaction)
             elif validation.is_approval_eligible and transaction is not None and is_pg_business_type(transaction.business_type):
+                # 실구매처가 이미 있어도 영수증 사업자번호와 비즈노 조회값을
+                # 확인한 뒤에만 결재로 진행한다. 기존 값의 존재 자체는 검증 완료
+                # 신호가 아니다.
                 self._start_pg_lookup_from_validation(transaction, validation)
             elif validation.is_approval_eligible and transaction is not None:
                 self.status_message.set(
@@ -1622,6 +1929,29 @@ class EAccApplication(tb.Window):
         self._set_busy(True, "PG 영수증의 사업자번호를 비즈노에서 조회하는 중입니다...")
         self._start_moneypin_lookup(transaction, validation, business_number)
 
+    def _continue_with_existing_actual_merchant(
+        self,
+        transaction: UnsubmittedTransaction,
+    ) -> None:
+        """Keep a receipt/BizNo-verified existing merchant and request approval."""
+        merchant_name = transaction.actual_merchant_name.strip()
+        result = self._merchant_results.get(transaction.transaction_id)
+        message = (
+            f"기존 실구매처명 '{merchant_name}'이(가) 영수증·비즈노 조회값과 일치 "
+            "— 덮어쓰기 없이 결재요청 진행"
+        )
+        if result is not None:
+            self._merchant_results[transaction.transaction_id] = replace(
+                result,
+                status="기존 실구매처 일치",
+                registration_status="검증 완료",
+                registration_reason=message,
+            )
+        self._record_processing_event(transaction, "PG 기존 실구매처 일치", message)
+        self._apply_filter()
+        self.status_message.set(f"{message}...")
+        self.after(300, lambda: self._start_approval_request(transaction, automatic=True))
+
     def _validate_all_synchronized_receipts(self) -> None:
         if self.current_summary is None:
             messagebox.showinfo(
@@ -1685,7 +2015,7 @@ class EAccApplication(tb.Window):
         self._receipt_results[validation.transaction_id] = validation
         transaction = self._batch_current
         if transaction is not None and transaction.transaction_id == validation.transaction_id:
-            self._evaluate_account_rules(transaction, validation.ocr_text)
+            self._evaluate_account_rules(transaction, self._account_validation_text(validation))
         self._finish_one_batch_receipt()
 
     def _on_batch_receipt_error(self, error: Exception) -> None:
@@ -1869,14 +2199,20 @@ class EAccApplication(tb.Window):
         )
 
     def _on_unprocessed_card_uses(self, uses: tuple[UnprocessedCardUse, ...]) -> None:
-        self._unprocessed_card_uses = uses
+        mail_uses = tuple(
+            use for use in uses if not self._is_unprocessed_mail_excluded(use)
+        )
+        self._unprocessed_card_uses = mail_uses
         # The mail module has no separate screen: after the e-Acc result has
         # arrived, dispose of its temporary Edge session and continue directly
         # to Outlook delivery.  Results remain in the main-window Mail Log.
         self._reset_browser_service_after_unprocessed_query()
-        if not uses:
+        if not mail_uses:
             self._set_busy(False)
-            self.status_message.set("e-Acc 미처리내역 대상이 없어 메일을 발송하지 않았습니다.")
+            if uses:
+                self.status_message.set("성태현 건은 발송 제외 대상으로 메일을 발송하지 않았습니다.")
+            else:
+                self.status_message.set("e-Acc 미처리내역 대상이 없어 메일을 발송하지 않았습니다.")
             return
         self._send_unprocessed_mail()
         return
@@ -1924,9 +2260,158 @@ class EAccApplication(tb.Window):
         row = matches[0]
         return MailRecipient(row["name"], row["email"], row["department"]), "발송 가능"
 
+    @staticmethod
+    def _is_unprocessed_mail_excluded(use: UnprocessedCardUse) -> bool:
+        return "".join(use.employee_name.split()) in UNPROCESSED_MAIL_EXCLUDED_EMPLOYEE_NAMES
+
+    @staticmethod
+    def _normalized_team_name(value: str) -> str:
+        return "".join(str(value or "").split()).casefold()
+
+    @classmethod
+    def _display_team_name(cls, value: str) -> str:
+        """Show one consistent team name even for abbreviated directory data."""
+        raw_value = str(value or "").strip()
+        if not raw_value:
+            # A historical event can exist without its source-row snapshot.
+            # Do not leave an ambiguous blank that could be mistaken for a
+            # mail target; make the missing source data explicit instead.
+            return "미확인"
+        return TEAM_EXCEPTION_DISPLAY_NAMES.get(cls._normalized_team_name(raw_value), raw_value)
+
+    @classmethod
+    def _mail_log_team_name(cls, department: str, subject: str) -> str:
+        # Team-exception subjects have the authoritative full team name, so
+        # older logs whose recipient directory held only '강북' also display
+        # the same canonical name as newly sent messages.
+        prefix = "[확인 요청] "
+        marker = " 법인카드 예외처리"
+        if str(subject).startswith(prefix) and marker in str(subject):
+            candidate = str(subject)[len(prefix):].split(marker, 1)[0]
+            return cls._display_team_name(candidate)
+        return cls._display_team_name(department)
+
+    def _resolve_exception_team_recipient(self, cost_center: str) -> tuple[MailRecipient | None, str]:
+        expected_name = TEAM_EXCEPTION_MAIL_RECIPIENTS.get(self._normalized_team_name(cost_center))
+        if not expected_name:
+            return None, "팀 담당자 미지정"
+        matches = [
+            row for row in self._mail_recipients
+            if row["name"].replace(" ", "") == expected_name.replace(" ", "")
+        ]
+        if len(matches) != 1:
+            return None, "팀 담당자 이메일 미확인"
+        row = matches[0]
+        return MailRecipient(row["name"], row["email"], row["department"]), "발송 가능"
+
+    def _start_exception_team_mail(self, uses: tuple[ExceptionMailUse, ...]) -> None:
+        """Start one Outlook worker for today's eligible exception rows."""
+        if self._exception_team_mail_sending or self._busy:
+            self.status_message.set("현재 다른 작업이 진행 중이어서 팀 담당자 메일을 시작할 수 없습니다.")
+            return
+        grouped: list[tuple[str, MailRecipient, tuple[ExceptionMailUse, ...]]] = []
+        problems: list[tuple[str, tuple[ExceptionMailUse, ...], str]] = []
+        by_team: dict[str, list[ExceptionMailUse]] = {}
+        for use in uses:
+            by_team.setdefault(self._display_team_name(use.cost_center), []).append(use)
+        for cost_center, team_uses in by_team.items():
+            recipient, status = self._resolve_exception_team_recipient(cost_center)
+            frozen_uses = tuple(team_uses)
+            if recipient is None:
+                problems.append((cost_center, frozen_uses, status))
+            else:
+                grouped.append((cost_center, recipient, frozen_uses))
+        if not grouped and not problems:
+            self.status_message.set("오늘 처리한 영수증 등록 예외처리 건이 없어 메일을 발송하지 않았습니다.")
+            return
+        self._exception_team_mail_sending = True
+        self._active_mail_delivery_batch_id = f"exception-{datetime.now().strftime('%Y%m%d')}-{uuid4().hex}"
+        self._set_busy(True, "팀 담당자 예외처리 안내메일을 발송하고 Mail Log에 기록하는 중입니다...")
+        threading.Thread(
+            target=self._send_exception_team_mail_worker,
+            args=(tuple(grouped), tuple(problems), self._active_mail_delivery_batch_id),
+            daemon=True,
+        ).start()
+
+    def _send_exception_team_mail_worker(
+        self,
+        grouped: tuple[tuple[str, MailRecipient, tuple[ExceptionMailUse, ...]], ...],
+        problems: tuple[tuple[str, tuple[ExceptionMailUse, ...], str], ...],
+        batch_id: str,
+    ) -> None:
+        com_runtime = self._initialize_outlook_com_for_worker()
+        process_date = datetime.now().astimezone().date().isoformat()
+        for cost_center, uses, status in problems:
+            self.repository.record_mail_log(
+                recipient_name="", recipient_email="", department=cost_center,
+                transaction_ids=tuple(use.transaction_id for use in uses),
+                subject=f"[확인 요청] {cost_center} 법인카드 예외처리 {len(uses)}건",
+                status=status, reason="팀 담당자 정보를 확인하지 못해 메일을 발송하지 않았습니다.",
+                mail_batch_id=batch_id,
+            )
+        if not grouped:
+            self._uninitialize_outlook_com_for_worker(com_runtime)
+            self.after(0, self._on_exception_team_mail_finished)
+            return
+        try:
+            with self._mail_outlook_lock:
+                send_context = None
+                try:
+                    send_context = open_outlook_send_context()
+                except Exception as exc:
+                    for cost_center, recipient, uses in grouped:
+                        self.repository.record_mail_log(
+                            recipient_name=recipient.name, recipient_email=recipient.email, department=cost_center,
+                            transaction_ids=tuple(use.transaction_id for use in uses),
+                            subject=f"[확인 요청] {cost_center} 법인카드 예외처리 {len(uses)}건",
+                            status="발송 실패", reason=str(exc), mail_batch_id=batch_id,
+                        )
+                else:
+                    try:
+                        total = len(grouped)
+                        for index, (cost_center, recipient, uses) in enumerate(grouped, start=1):
+                            ids = tuple(use.transaction_id for use in uses)
+                            subject = f"[확인 요청] {cost_center} 법인카드 예외처리 {len(uses)}건"
+                            if index == 1 or index == total:
+                                self.after(0, self._set_busy, True, f"팀 담당자 예외처리 안내메일 발송 중 ({index}/{total})...")
+                            try:
+                                status, outlook_message_id = send_via_outlook(
+                                    recipient,
+                                    render_exception_mail_html(cost_center, uses, process_date),
+                                    context=send_context,
+                                    subject=subject,
+                                )
+                            except Exception as exc:
+                                self.repository.record_mail_log(
+                                    recipient_name=recipient.name, recipient_email=recipient.email, department=cost_center,
+                                    transaction_ids=ids, subject=subject, status="발송 실패",
+                                    reason=str(exc), mail_batch_id=batch_id,
+                                )
+                            else:
+                                self.repository.record_mail_log(
+                                    recipient_name=recipient.name, recipient_email=recipient.email, department=cost_center,
+                                    transaction_ids=ids, subject=subject, status=status,
+                                    reason="오늘 처리된 영수증 등록 예외처리 건 Outlook 발송 요청 완료",
+                                    outlook_message_id=outlook_message_id, mail_batch_id=batch_id,
+                                )
+                    finally:
+                        send_context.close()
+        finally:
+            self._uninitialize_outlook_com_for_worker(com_runtime)
+            self.after(0, self._on_exception_team_mail_finished)
+
+    def _on_exception_team_mail_finished(self) -> None:
+        self._exception_team_mail_sending = False
+        self._refresh_mail_log()
+        self._set_busy(False)
+        self.status_message.set("팀 담당자 예외처리 안내메일 발송 결과를 Mail Log에 기록했습니다.")
+        self._delivery_poll_attempts_left = len(MAIL_DELIVERY_POLL_DELAYS_MS)
+        self.after(MAIL_DELIVERY_POLL_DELAYS_MS[0], self._poll_outlook_delivery_status)
+
     def _send_unprocessed_mail(self) -> None:
         if not self._unprocessed_card_uses:
             return
+        self._active_mail_delivery_batch_id = uuid4().hex
         self._set_busy(True, "Outlook 안내메일을 발송하고 메일 Log에 기록하는 중입니다...")
         threading.Thread(target=self._send_unprocessed_mail_worker, daemon=True).start()
         return
@@ -1935,9 +2420,15 @@ class EAccApplication(tb.Window):
         threading.Thread(target=self._send_unprocessed_mail_worker, daemon=True).start()
 
     def _send_unprocessed_mail_worker(self) -> None:
+        com_runtime = self._initialize_outlook_com_for_worker()
+        batch_id = self._active_mail_delivery_batch_id
         grouped: dict[MailRecipient, list[UnprocessedCardUse]] = {}
         problems: list[tuple[UnprocessedCardUse, str]] = []
         for use in self._unprocessed_card_uses:
+            # 조회 결과가 다른 경로에서 주입되더라도 성태현 건은 메일 묶음에
+            # 들어가지 않도록 발송 직전에도 한 번 더 보호한다.
+            if self._is_unprocessed_mail_excluded(use):
+                continue
             recipient, status = self._resolve_mail_recipient(use)
             if recipient is None:
                 problems.append((use, status))
@@ -1949,117 +2440,195 @@ class EAccApplication(tb.Window):
                 grouped.setdefault(recipient, []).append(use)
         for use, status in problems:
             self.repository.record_mail_log(recipient_name=use.employee_name, recipient_email="", department=use.department, transaction_ids=(use.transaction_id,), subject=MAIL_SUBJECT, status=status, reason="수신자를 확정할 수 없어 메일을 발송하지 않았습니다.")
-        # Build the Outlook COM handle + resolved sender account ONCE and
-        # reuse it for every recipient in this bulk run.  Previously each
-        # call to ``send_via_outlook`` re-did ``Dispatch("Outlook.Application")``
-        # and re-scanned ``Session.Accounts``; multiplied by 70 recipients
-        # that produced ~500 COM round-trips against a synchronising Outlook
-        # profile, which was the main reason the desktop UI froze for
-        # several minutes on bulk runs.  The context also paces successive
-        # ``Send`` calls (~0.3s each) so Exchange has time to accept them
-        # without throttling - throttling is what turned an ordinary slow
-        # loop into a multi-minute PC-wide stall.
         try:
-            send_context = open_outlook_send_context()
-        except Exception as exc:
-            # If Outlook itself is unreachable, log every remaining group as
-            # a failure so the user gets a clear per-recipient audit trail
-            # instead of one opaque error at the top of the run.
-            for recipient, uses in grouped.items():
-                ids = tuple(use.transaction_id for use in uses)
-                self.repository.record_mail_log(recipient_name=recipient.name, recipient_email=recipient.email, department=recipient.department, transaction_ids=ids, subject=MAIL_SUBJECT, status="발송 실패", reason=str(exc))
+            # One serial worker owns Outlook COM for the full send.  In
+            # particular, delivery checks cannot enter Outlook until this lock
+            # is released, preventing send/sync/check contention.
+            with self._mail_outlook_lock:
+                send_context = None
+                try:
+                    send_context = open_outlook_send_context()
+                except Exception as exc:
+                    for recipient, uses in grouped.items():
+                        ids = tuple(use.transaction_id for use in uses)
+                        self.repository.record_mail_log(recipient_name=recipient.name, recipient_email=recipient.email, department=recipient.department, transaction_ids=ids, subject=MAIL_SUBJECT, status="발송 실패", reason=str(exc))
+                else:
+                    try:
+                        total = len(grouped)
+                        for index, (recipient, uses) in enumerate(grouped.items(), start=1):
+                            ids = tuple(use.transaction_id for use in uses)
+                            # Web UI synchronisation is intentionally not
+                            # forced for every recipient. Coarse progress is
+                            # enough and avoids repaint pressure during a
+                            # large Outlook batch.
+                            if index == 1 or index == total or index % 5 == 0:
+                                self.after(0, self._set_busy, True, f"Outlook 안내메일 발송 중 ({index}/{total})...")
+                            try:
+                                status, outlook_message_id = send_via_outlook(recipient, render_mail_html(recipient.name, uses), context=send_context)
+                            except Exception as exc:
+                                self.repository.record_mail_log(recipient_name=recipient.name, recipient_email=recipient.email, department=recipient.department, transaction_ids=ids, subject=MAIL_SUBJECT, status="발송 실패", reason=str(exc))
+                            else:
+                                self.repository.record_mail_log(
+                                    recipient_name=recipient.name, recipient_email=recipient.email,
+                                    department=recipient.department, transaction_ids=ids,
+                                    subject=MAIL_SUBJECT, status=status,
+                                    reason="Outlook 발송 요청 완료",
+                                    outlook_message_id=outlook_message_id,
+                                    mail_batch_id=batch_id,
+                                )
+                    finally:
+                        # Release only our COM references; never close Outlook.
+                        send_context.close()
+        finally:
+            self._uninitialize_outlook_com_for_worker(com_runtime)
             self.after(0, self._on_unprocessed_mail_finished)
-            return
-        total = len(grouped)
-        for index, (recipient, uses) in enumerate(grouped.items(), start=1):
-            ids = tuple(use.transaction_id for use in uses)
-            # Update the busy banner so the user can see progress instead
-            # of a static "발송 중..." message during a long bulk run.
-            self.after(0, self._set_busy, True, f"Outlook 안내메일 발송 중 ({index}/{total})...")
-            try:
-                status, outlook_message_id = send_via_outlook(recipient, render_mail_html(recipient.name, uses), context=send_context)
-            except Exception as exc:
-                self.repository.record_mail_log(recipient_name=recipient.name, recipient_email=recipient.email, department=recipient.department, transaction_ids=ids, subject=MAIL_SUBJECT, status="발송 실패", reason=str(exc))
-            else:
-                reason = {"발송 완료": "Outlook 보낸 편지함 확인", "발송 대기": "Outlook 보낼 편지함 대기", "발송 확인 불가": "Outlook 폴더에서 발송 결과를 확인하지 못했습니다."}[status]
-                self.repository.record_mail_log(recipient_name=recipient.name, recipient_email=recipient.email, department=recipient.department, transaction_ids=ids, subject=MAIL_SUBJECT, status=status, reason=reason, outlook_message_id=outlook_message_id)
-        self.after(0, self._on_unprocessed_mail_finished)
 
     def _on_unprocessed_mail_finished(self) -> None:
         self._refresh_mail_log()
         self._set_busy(False)
         self.status_message.set("Outlook 발송 결과를 메일 Log에 기록했습니다.")
-        # 상태 확인 폴링: Exchange가 대량 발송 후 보낸편지함 반영까지
-        # 몇십 초 걸리는 경우가 있어서 한 번만 확인하면 '발송 대기'로
-        # 남아버린다.  5초 간격으로 최대 60초(=12회)까지 자동 재확인.
-        self._delivery_poll_attempts_left = 12
-        self.after(3000, self._poll_outlook_delivery_status)
-        return
-        self.unprocessed_send_button.configure(state="normal" if self._unprocessed_card_uses else "disabled")
-        self.unprocessed_status_var.set("Outlook 발송 결과를 메일 Log에 기록했습니다.")
+        # Do not query any Outlook folder while sending. The first check runs
+        # after Outlook has had a short chance to complete its own transport.
+        self._delivery_poll_attempts_left = len(MAIL_DELIVERY_POLL_DELAYS_MS)
+        self.after(MAIL_DELIVERY_POLL_DELAYS_MS[0], self._poll_outlook_delivery_status)
 
     def _poll_outlook_delivery_status(self) -> None:
-        """미결(발송 대기/확인 불가) 항목이 없어질 때까지 주기적으로 재확인."""
-        pending_before = sum(
-            1 for item in self.repository.recent_mail_logs()
-            if item.status in {"발송 대기", "발송 확인 불가"} and item.outlook_message_id
-        )
-        self._refresh_outlook_delivery_status()
-        pending_after = sum(
-            1 for item in self.repository.recent_mail_logs()
-            if item.status in {"발송 대기", "발송 확인 불가"} and item.outlook_message_id
-        )
-        attempts_left = getattr(self, "_delivery_poll_attempts_left", 0) - 1
-        self._delivery_poll_attempts_left = attempts_left
-        # 모두 확인됐거나 시도 횟수를 다 썼으면 종료.
-        if pending_after == 0 or attempts_left <= 0:
-            if hasattr(self, "unprocessed_status_var"):
-                if pending_after == 0:
-                    self.unprocessed_status_var.set(
-                        f"발송 결과 확인 완료: {pending_before}건 최신화됨"
-                    )
-                else:
-                    self.unprocessed_status_var.set(
-                        f"발송 결과 확인 종료: 미확인 {pending_after}건 (Outlook 재확인 필요)"
-                    )
+        """Queue a bounded background delivery check after a bulk send."""
+        if self._mail_delivery_check_running:
+            self.after(1_000, self._poll_outlook_delivery_status)
             return
-        # 아직 확인 안 된 항목이 있으면 5초 뒤 재시도.
-        if hasattr(self, "unprocessed_status_var"):
-            self.unprocessed_status_var.set(
-                f"발송 결과 확인 중... 대기 {pending_after}건 (남은 재시도 {attempts_left}회)"
-            )
-        self.after(5000, self._poll_outlook_delivery_status)
+        self._delivery_poll_attempts_left -= 1
+        self._request_recent_mail_delivery_check(
+            polling=True,
+            batch_id=self._active_mail_delivery_batch_id,
+        )
 
     def _refresh_outlook_delivery_status(self) -> None:
-        updated = 0
-        for item in self.repository.recent_mail_logs():
-            if item.status not in {"발송 대기", "발송 확인 불가"} or not item.outlook_message_id:
+        # Compatibility entry point for the former button.  It now keeps COM
+        # work off the tkinter/webview thread as well.
+        self._request_recent_mail_delivery_check()
+
+    def _recent_pending_mail_logs(self, batch_id: str = ""):
+        cutoff = datetime.now().astimezone() - timedelta(days=MAIL_DELIVERY_RECHECK_DAYS)
+        result = []
+        for item in self.repository.recent_mail_logs(limit=200):
+            if item.status not in {"발송 요청", "발송 대기", "발송 확인 중", "발송 확인 불가"} or not item.outlook_message_id:
                 continue
             try:
-                status = outlook_delivery_status(item.outlook_message_id)
-            except Exception:
-                # Outlook can briefly reject COM requests while synchronizing.
-                # Keep the recorded state and try again on the next mail run.
+                sent_at = datetime.fromisoformat(item.sent_at)
+            except ValueError:
                 continue
-            if status != item.status:
-                reason = "Outlook 보낸 편지함 확인" if status == "발송 완료" else "Outlook 보낼 편지함 대기" if status == "발송 대기" else "Outlook 폴더에서 발송 결과를 확인하지 못했습니다."
-                self.repository.update_mail_status(item.log_id, status, reason)
-                updated += 1
+            if sent_at >= cutoff:
+                result.append(item)
+        if batch_id:
+            return tuple(item for item in result if item.mail_batch_id == batch_id)
+        # On startup or when the Log tab opens, inspect only the newest
+        # unresolved batch.  Historical batches remain auditable without
+        # turning one UI action into a full-mailbox reconciliation.
+        newest_batch_id = next((item.mail_batch_id for item in result if item.mail_batch_id), "")
+        if newest_batch_id:
+            return tuple(item for item in result if item.mail_batch_id == newest_batch_id)
+        return tuple(result[:1])
+
+    def _request_recent_mail_delivery_check(self, polling: bool = False, batch_id: str = "") -> None:
+        if self._mail_delivery_check_running:
+            return
+        self._mail_delivery_check_running = True
+        threading.Thread(
+            target=self._recent_mail_delivery_check_worker,
+            args=(polling, batch_id), daemon=True,
+        ).start()
+
+    def _recent_mail_delivery_check_worker(self, polling: bool, batch_id: str) -> None:
+        updated = 0
+        candidates = self._recent_pending_mail_logs(batch_id)
+        com_runtime = self._initialize_outlook_com_for_worker()
+        try:
+            # This is the sole delivery-check path. It waits for a send to
+            # finish instead of issuing concurrent COM requests to Outlook.
+            with self._mail_outlook_lock:
+                if candidates:
+                    earliest_sent_at = min(
+                        datetime.fromisoformat(item.sent_at) for item in candidates
+                    )
+                    statuses = outlook_delivery_statuses(
+                        (item.outlook_message_id for item in candidates),
+                        since=earliest_sent_at,
+                    )
+                    for item in candidates:
+                        status = statuses.get(item.outlook_message_id, "발송 확인 불가")
+                        # A transient synchronisation delay is not evidence of
+                        # delivery failure. Keep the existing state until the
+                        # bounded polling window has actually elapsed.
+                        if status == "발송 확인 불가":
+                            if polling and item.status in {"발송 요청", "발송 대기"}:
+                                self.repository.update_mail_status(
+                                    item.log_id,
+                                    "발송 확인 중",
+                                    "Outlook 동기화 완료를 기다리는 중입니다.",
+                                )
+                                updated += 1
+                            continue
+                        if status == item.status:
+                            continue
+                        reason = "Outlook 보낸 편지함 확인" if status == "발송 완료" else "Outlook 보낼 편지함 대기"
+                        self.repository.update_mail_status(item.log_id, status, reason)
+                        updated += 1
+        finally:
+            self._uninitialize_outlook_com_for_worker(com_runtime)
+            self.after(0, self._on_recent_mail_delivery_check_finished, polling, batch_id, updated)
+
+    @staticmethod
+    def _initialize_outlook_com_for_worker():
+        """Give this worker its own COM apartment; no Outlook UI is closed."""
+        try:
+            import pythoncom  # type: ignore[import-not-found]
+        except ImportError:
+            return None
+        pythoncom.CoInitialize()
+        return pythoncom
+
+    @staticmethod
+    def _uninitialize_outlook_com_for_worker(com_runtime) -> None:
+        if com_runtime is not None:
+            com_runtime.CoUninitialize()
+
+    def _on_recent_mail_delivery_check_finished(self, polling: bool, batch_id: str, updated: int) -> None:
+        self._mail_delivery_check_running = False
         self._refresh_mail_log()
-        if hasattr(self, "unprocessed_status_var"):
-            self.unprocessed_status_var.set(f"발송 결과 확인 완료: 상태 변경 {updated}건")
+        remaining = len(self._recent_pending_mail_logs(batch_id))
+        if polling and remaining and self._delivery_poll_attempts_left > 0:
+            next_delay_index = len(MAIL_DELIVERY_POLL_DELAYS_MS) - self._delivery_poll_attempts_left
+            self.after(MAIL_DELIVERY_POLL_DELAYS_MS[next_delay_index], self._poll_outlook_delivery_status)
+            return
+        if polling and remaining:
+            # The full bounded polling window elapsed without finding these
+            # queued messages in either Outlook folder.  Only now is
+            # '발송 확인 불가' an honest final result for this run.
+            for item in self._recent_pending_mail_logs(batch_id):
+                if item.status in {"발송 요청", "발송 대기", "발송 확인 중"}:
+                    self.repository.update_mail_status(
+                        item.log_id,
+                        "발송 확인 불가",
+                        "Outlook 보낸/보낼 편지함에서 발송 결과를 확인하지 못했습니다.",
+                    )
+            self._refresh_mail_log()
+            self.status_message.set(f"메일 발송 확인 종료: 미확인 {remaining}건 (Mail_발송_Log에서 재확인)")
+        elif updated:
+            self.status_message.set(f"메일 발송 결과 확인: {updated}건 최신화됨")
 
     def _refresh_mail_log(self) -> None:
         if not hasattr(self, "mail_log_tree"):
             return
         self.mail_log_tree.delete(*self.mail_log_tree.get_children())
         for item in self.repository.recent_mail_logs():
-            tag = "mail-error" if item.status in {"발송 실패", "이메일 미확인", "부서 불일치"} else "mail-warning" if item.status in {"발송 대기", "발송 확인 불가"} else ""
-            self.mail_log_tree.insert("", "end", values=(self._format_timestamp(item.sent_at), item.recipient_name, item.recipient_email, item.transaction_count, item.subject, item.status, item.reason), tags=(tag,) if tag else ())
+            tag = "mail-error" if item.status in {"발송 실패", "이메일 미확인", "부서 불일치"} else "mail-warning" if item.status in {"발송 요청", "발송 대기", "발송 확인 중", "발송 확인 불가"} else ""
+            self.mail_log_tree.insert("", "end", values=(self._format_timestamp(item.sent_at), item.recipient_name, item.recipient_email, item.transaction_count, item.subject, item.status, item.reason, self._mail_log_team_name(item.department, item.subject)), tags=(tag,) if tag else ())
 
     def _set_busy(self, busy: bool, message: str = "") -> None:
+        self._busy = busy
         state = "disabled" if busy else "normal"
-        self.current_target_button.configure(state=state)
+        self._refresh_automation_button()
         self.unsubmitted_menu_button.configure(state=state)
         self.unprocessed_mail_button.configure(state=state)
         self.login_id_entry.configure(state=state)
@@ -2225,11 +2794,29 @@ class EAccApplication(tb.Window):
                     event.approval_number,
                     event.evidence_date,
                     event.amount,
+                    event.account_name,
                     event.merchant,
-                    event.reason,
+                    self._display_processing_reason(event.reason),
                     event.transaction_id,
                 ),
             )
+
+    @staticmethod
+    def _display_processing_reason(reason: str) -> str:
+        """Render older beverage audit records with the current concise wording.
+
+        The database remains an immutable record of the original OCR result.
+        Only its on-screen presentation is normalized, so reopening the app
+        does not leave historic rows filled with unreadable merged OCR text.
+        """
+        text = reason.strip()
+        if text.startswith("음료전용 적요: 음료·음식 분류 불가 품목 포함 허용"):
+            return "음료전용 적요: 품목 미분류 → 정상(w)"
+        if text.startswith("음료전용 적요: 품목명 OCR 미검출"):
+            return "음료전용 적요: 품목 OCR 미검출 → 정상(w)"
+        if text.startswith("음료전용 적요: 금액·수량이 있는 품목 줄이 모두 음료로 확인"):
+            return "음료전용 적요: 음료 품목 확인 → 정상"
+        return text
 
     @staticmethod
     def _format_timestamp(value: str) -> str:
@@ -2242,7 +2829,8 @@ class EAccApplication(tb.Window):
     @staticmethod
     def _compact_reason(reason: str, limit: int = 115) -> str:
         """Keep a result-grid reason useful without duplicating the full Log."""
-        compact = reason.split(" 숫자 후보:", maxsplit=1)[0].strip()
+        compact = EAccApplication._display_processing_reason(reason)
+        compact = compact.split(" 숫자 후보:", maxsplit=1)[0].strip()
         return compact if len(compact) <= limit else compact[: limit - 1].rstrip() + "…"
 
     def _show_processing_result_filter(self, filter_name: str) -> str:
@@ -2275,6 +2863,7 @@ class EAccApplication(tb.Window):
         grouped: dict[str, list[ProcessingEvent]] = {}
         for event in self.repository.recent_processing_events():
             grouped.setdefault(event.transaction_id, []).append(event)
+        cost_centers = self.repository.transaction_cost_centers(grouped)
         for transaction_id, newest_first in grouped.items():
             latest = newest_first[0]
             receipt_event = next(
@@ -2285,12 +2874,44 @@ class EAccApplication(tb.Window):
                 (event for event in newest_first if event.status.startswith("계정검증 ")),
                 None,
             )
+            # "현재 처리대상 읽음"처럼 예외처리 뒤에 남는 보조 Log가 있어도
+            # 최종 결과를 다시 처리대상으로 되돌리면 안 된다. 반대로 과거
+            # 예외처리 뒤에 새 계정검증이 정상으로 기록되면, 그 과거 예외는
+            # 새 실행에서 이미 재검증된 것이므로 최종 상태로 쓰지 않는다.
+            terminal_event = next(
+                (
+                    event
+                    for event in newest_first
+                    if event.status in {"처리 완료", "예외처리"}
+                ),
+                None,
+            )
+            account_rechecked_after_terminal = (
+                account_event is not None
+                and terminal_event is not None
+                and account_event.event_id > terminal_event.event_id
+            )
+            account_exception_after_terminal = (
+                account_rechecked_after_terminal
+                and account_event is not None
+                and account_event.status == "계정검증 예외"
+            )
+            display_event = (
+                account_event
+                if account_exception_after_terminal and account_event is not None
+                else terminal_event
+                if terminal_event is not None and not account_rechecked_after_terminal
+                else latest
+            )
+            display_status = "예외처리" if account_exception_after_terminal else display_event.status
             pg_event = next(
                 (
                     event
                     for event in newest_first
                     if event.status.startswith("PG ")
                     or event.status.startswith("실구매처 등록")
+                    # 이전 실행에서 저장된 명칭도 PG 검증 이력으로 보존한다.
+                    or event.status == "기존 실구매처 등록 확인"
                 ),
                 None,
             )
@@ -2326,13 +2947,13 @@ class EAccApplication(tb.Window):
                 if pg_event is not None
                 else "대상 아님"
             )
-            if latest.status == "처리 완료":
+            if display_status == "처리 완료":
                 approval_status = "결재 완료"
-            elif latest.status == "예외처리" and "다른 사용자" in latest.reason:
+            elif display_status == "예외처리" and "다른 사용자" in display_event.reason:
                 approval_status = "다른 사용자 처리 중"
-            elif latest.status == "예외처리" and "결재요청 후" in latest.reason:
+            elif display_status == "예외처리" and "결재요청 후" in display_event.reason:
                 approval_status = "목록 유지"
-            elif latest.status == "예외처리":
+            elif display_status == "예외처리":
                 approval_status = "결재 미실행"
             elif approval_event is None:
                 approval_status = "미실행"
@@ -2346,8 +2967,8 @@ class EAccApplication(tb.Window):
                     "목록 유지": "목록 유지",
                 }[approval_event.status]
             final_status = (
-                latest.status
-                if latest.status in {"처리 완료", "예외처리", "PG 등록", "PG 등록 대기"}
+                display_status
+                if display_status in {"처리 완료", "예외처리", "PG 등록", "PG 등록 대기"}
                 else "처리중" if approval_event is not None else "처리대상"
             )
             # 이전 실행 이력의 기존 표기는 화면에서도 새 상태명으로 통일한다.
@@ -2364,14 +2985,21 @@ class EAccApplication(tb.Window):
             ):
                 continue
             if (
-                self._processing_result_filter == "pg_pending"
+                self._processing_result_filter == "pg_review"
                 and pg_status == "대상 아님"
             ):
                 continue
-            reason = "-" if final_status == "처리 완료" else self._compact_reason(latest.reason)
+            reason = "-" if final_status == "처리 완료" else self._compact_reason(display_event.reason)
             account_name = next(
                 (event.account_name for event in newest_first if event.account_name),
                 "",
+            )
+            is_receipt_unavailable_exception = (
+                final_status == "예외처리"
+                and (
+                    receipt_status in {"동기화 대기", "영수증 미등록", "재조회 필요", "검증 보류"}
+                    or "증빙유무 #이 아니어서" in display_event.reason
+                )
             )
             result_tag = {
                 "예외처리": "결과-예외처리",
@@ -2379,16 +3007,21 @@ class EAccApplication(tb.Window):
                 "처리대상": "결과-처리대상",
                 "처리중": "결과-처리대상",
             }.get(final_status, "")
+            if is_receipt_unavailable_exception:
+                # 영수증이 없어서 멈춘 건은 오류(빨강)가 아닌 보류·확인
+                # 대상(주황)으로 표시한다. 최종 상태 텍스트는 모두
+                # '예외처리'로 유지해 기존 필터·집계에는 영향을 주지 않는다.
+                result_tag = "결과-증빙예외"
             self.processing_results_tree.insert(
                 "",
                 "end",
                 values=(
-                    self._format_timestamp(latest.event_at),
-                    latest.approval_number,
-                    latest.evidence_date,
-                    latest.amount,
+                    self._format_timestamp(display_event.event_at),
+                    display_event.approval_number,
+                    display_event.evidence_date,
+                    display_event.amount,
                     account_name,
-                    latest.merchant,
+                    display_event.merchant,
                     receipt_status,
                     account_status,
                     pg_status,
@@ -2396,6 +3029,7 @@ class EAccApplication(tb.Window):
                     final_status,
                     reason,
                     transaction_id,
+                    self._display_team_name(cost_centers.get(transaction_id, "")),
                 ),
                 tags=(result_tag,) if result_tag else (),
             )
@@ -2404,7 +3038,7 @@ class EAccApplication(tb.Window):
         self,
         rows: tuple[ImportDisplayRow, ...],
     ) -> None:
-        """Record the result of one-row e-Acc approval after a fresh list read."""
+        """Confirm a requested approval without mistaking e-Acc sync delay for failure."""
         if not self._pending_approval_transactions:
             return
         self._last_approval_removed_from_list = False
@@ -2415,11 +3049,46 @@ class EAccApplication(tb.Window):
         }
         for transaction_id, transaction in tuple(self._pending_approval_transactions.items()):
             if transaction_id in current_ids:
-                self._record_processing_event(
-                    transaction,
-                    "예외처리",
-                    "결재요청 후 최신 e-Acc 목록에도 이 행이 남아 있습니다. 결재 요청 상태를 확인해 주세요.",
-                )
+                completed_checks = self._pending_approval_confirmation_attempts.get(transaction_id, 0) + 1
+                if completed_checks < len(EACC_APPROVAL_CONFIRMATION_DELAYS_MS):
+                    self._pending_approval_confirmation_attempts[transaction_id] = completed_checks
+                    next_delay = EACC_APPROVAL_CONFIRMATION_DELAYS_MS[completed_checks]
+                    self._record_processing_event(
+                        transaction,
+                        "결재요청 확인대기",
+                        "결재요청 직후 최신 목록에 행이 남아 있습니다. "
+                        f"e-Acc 반영을 위해 {next_delay // 1000}초 뒤 재확인합니다. "
+                        f"({completed_checks}/{len(EACC_APPROVAL_CONFIRMATION_DELAYS_MS)}차 확인 완료)",
+                    )
+                    self.after(
+                        next_delay,
+                        lambda pending=transaction: self._refresh_after_eacc_approval(pending),
+                    )
+                    continue
+                retry_once_ids = getattr(self, "_approval_reprocess_once_ids", set())
+                if transaction_id not in retry_once_ids:
+                    retry_once_ids.add(transaction_id)
+                    self._approval_reprocess_once_ids = retry_once_ids
+                    self._record_processing_event(
+                        transaction,
+                        "결재요청 재처리",
+                        "결재요청 후 최신 e-Acc 목록에 행이 남아 있어, 동일 행을 한 번만 다시 처리합니다.",
+                    )
+                    # 이 행은 아직 예외로 제외하지 않는다. 아래의 기존 재개 흐름이
+                    # 최신 목록의 동일 첫 행을 다시 읽어 OCR·결재요청을 한 번만
+                    # 처음부터 수행하게 한다.
+                    self._last_approval_removed_from_list = True
+                else:
+                    self._record_processing_event(
+                        transaction,
+                        "예외처리",
+                        "결재요청 재처리 후에도 최신 e-Acc 목록에 행이 남아 있습니다. "
+                        "이 행은 예외로 남기고 다음 행을 처리합니다.",
+                    )
+                    # 두 번째 결과까지 불확실한 행은 다시 요청하지 않는다. 예외
+                    # 대상으로 제외한 뒤 기존 자동 흐름이 다음 행을 읽게 한다.
+                    self._excluded_transaction_ids.add(transaction_id)
+                    self._last_approval_removed_from_list = True
             else:
                 self._record_processing_event(
                     transaction,
@@ -2428,6 +3097,7 @@ class EAccApplication(tb.Window):
                 )
                 self._last_approval_removed_from_list = True
             del self._pending_approval_transactions[transaction_id]
+            self._pending_approval_confirmation_attempts.pop(transaction_id, None)
         self._apply_filter()
 
     def _show_validation_criteria(self, _event: tk.Event[tk.Misc] | None = None) -> str | None:
@@ -2467,11 +3137,12 @@ class EAccApplication(tb.Window):
             tree.column(column, width=widths[column], anchor="center" if column == "구분" else "w")
         criteria = (
             ("공통 영수증", "증빙유무 #", "승인번호·증빙일자·사용금액을 영수증 OCR 값과 비교", "영수증 OCR 불일치"),
-            ("PG 처리", "업종에 PG일반 포함", "사업자번호 OCR → 비즈노 상호조회 → 실구매처 자동입력 → 사용자 확인", "PG 입력 확인 거부 / 조회·등록 확인 필요"),
-            ("계정별", "특근자식비", "15,000원당 인정 직원 최소 1명 확인", "특근자식비 사용인원 불충족"),
+            ("PG 처리", "업종에 PG일반·기타4 포함", "사업자번호 OCR → 비즈노 상호조회 → 실구매처 자동입력 → 사용자 확인", "PG 입력 확인 거부 / 조회·등록 확인 필요"),
+            ("계정별", "특근자식비", "90,000원 초과 제외 / 15,000원당 인정 직원 최소 1명 확인", "특근자식비 사용금액 초과 / 사용인원 불충족"),
             ("계정별", "차량유지비-유류대·주차비·세차비·통행료", "영수증 키워드와 계정 유형을 비교", "계정과 상이한 영수증 첨부"),
-            ("계정별", "일반복리비-현장지원 (현장대리인 활동지원 식음료대)", "20만원 초과, 주류 문구, 적요 작성 여부 확인", "사용금액 초과 / 주류 포함 / 불필요한 적요 작성"),
-            ("계정별", "회의비·부서회의비·업무회의비·일반복리비", "자동 결재 제외", "계정별 예외처리"),
+            ("계정별", "일반복리비-현장지원 · 활동지원 식음료대", "20만원 이하 / 주류 품목 없음", "사용금액 초과 / 주류 품목"),
+            ("계정별", "일반복리비-현장지원 · 음료전용 적요", "20만원 이하 / 음식·주류 품목 제외 (미검출·미분류: 정상(w))", "사용금액 초과 / 음식·주류 품목"),
+            ("계정별", "부서회의비·업무회의비·일반복리비", "자동 결재 제외", "계정별 예외처리"),
         )
         for row in criteria:
             tree.insert("", "end", values=row)
@@ -2507,13 +3178,18 @@ class EAccApplication(tb.Window):
         self.after(400, self._push_web_state)
 
     def _build_web_state(self) -> dict:
-        busy = str(self.current_target_button["state"]) == "disabled"
+        mode, label, enabled = self._automation_button_control()
         return {
             "kpi": {key: var.get() for key, var in self.session_vars.items()},
             "currentTarget": self.current_target_message.get(),
             "currentStage": self.current_stage_var.get(),
             "statusMessage": self.status_message.get(),
-            "busy": busy,
+            "busy": self._busy,
+            "processingControl": {
+                "mode": mode,
+                "label": label,
+                "enabled": enabled,
+            },
             "syncedAt": datetime.now().strftime("%H:%M:%S"),
             "tables": {
                 "transactions": _tree_snapshot(self.transactions_tree),
@@ -2559,7 +3235,7 @@ class EAccWebApi:
         self._app.after(0, _apply)
 
     def start_processing(self) -> None:
-        self._app.after(0, self._app._read_current_first_target)
+        self._app.after(0, self._app._toggle_automatic_processing)
 
     def show_guide(self) -> None:
         # 이 창은 이제 웹뷰(HTML/JS)에서 모달로 표시한다. 예전 tkinter
@@ -2576,16 +3252,35 @@ class EAccWebApi:
             "columns": ["구분", "대상 계정·업종", "검증 기준", "예외처리 사유"],
             "rows": [
                 ["공통 영수증", "증빙유무 #", "승인번호·증빙일자·사용금액을 영수증 OCR 값과 비교", "영수증 OCR 불일치"],
-                ["PG 처리", "업종에 PG일반 포함", "사업자번호 OCR → 비즈노 상호조회 → 실구매처 자동입력 → 사용자 확인", "PG 입력 확인 거부 / 조회·등록 확인 필요"],
-                ["계정별", "특근자식비", "15,000원당 인정 직원 최소 1명 확인", "특근자식비 사용인원 불충족"],
+                ["PG 처리", "업종에 PG일반·기타4 포함", "사업자번호 OCR → 비즈노 상호조회 → 실구매처 자동입력 → 사용자 확인", "PG 입력 확인 거부 / 조회·등록 확인 필요"],
+                ["계정별", "특근자식비", "90,000원 초과 제외 / 15,000원당 인정 직원 최소 1명 확인", "특근자식비 사용금액 초과 / 사용인원 불충족"],
                 ["계정별", "차량유지비-유류대·주차비·세차비·통행료", "영수증 키워드와 계정 유형을 비교", "계정과 상이한 영수증 첨부"],
-                ["계정별", "일반복리비-현장지원 (현장대리인 활동지원 식음료대)", "20만원 초과, 주류 문구, 적요 작성 여부 확인", "사용금액 초과 / 주류 포함 / 불필요한 적요 작성"],
-                ["계정별", "회의비·부서회의비·업무회의비·일반복리비", "자동 결재 제외", "계정별 예외처리"],
+                ["계정별", "일반복리비-현장지원 · 활동지원 식음료대", "20만원 이하 / 주류 품목 없음", "사용금액 초과 / 주류 품목"],
+                ["계정별", "일반복리비-현장지원 · 음료전용 적요", "20만원 이하 / 음식·주류 품목 제외 (미검출·미분류: 정상(w))", "사용금액 초과 / 음식·주류 품목"],
+                ["계정별", "부서회의비·업무회의비·일반복리비", "자동 결재 제외", "계정별 예외처리"],
             ],
         }
 
     def open_mail_window(self) -> None:
         self._app.after(0, self._app._run_unprocessed_mail_process)
+
+    def send_exception_team_mail(self) -> dict[str, object]:
+        """Queue today's receipt-backed exceptions after the web confirmation."""
+        if self._app._busy or self._app._exception_team_mail_sending:
+            return {"ok": False, "message": "현재 다른 작업이 진행 중입니다. 완료 후 다시 시도해 주세요."}
+        uses = self._app.repository.today_exception_mail_uses()
+        if not uses:
+            return {"ok": False, "message": "오늘 처리한 영수증 등록 예외처리 건이 없습니다."}
+        team_count = len({self._app._normalized_team_name(use.cost_center) for use in uses})
+        self._app.after(0, self._app._start_exception_team_mail, uses)
+        return {
+            "ok": True,
+            "message": f"오늘 처리한 영수증 등록 예외처리 {len(uses)}건을 {team_count}개 팀 담당자에게 발송합니다.",
+        }
+
+    def refresh_mail_delivery(self) -> None:
+        """Refresh only recent unresolved Mail Log rows, off the UI thread."""
+        self._app.after(0, self._app._request_recent_mail_delivery_check)
 
     def select_row(self, table: str, row_id: str) -> None:
         attr = self._TREE_ATTRS.get(table)
